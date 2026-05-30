@@ -1,0 +1,272 @@
+################################################################################
+# Script Name: 4. Smoking Status Engineering (NHANES 2017-2023)
+# Purpose:
+#   Define smoking status using the standard NHANES cigarette-smoking definition.
+#
+# Manuscript-consistent definition:
+#   Never smoker:
+#     - smoked fewer than 100 cigarettes in life
+#   Former smoker:
+#     - smoked at least 100 cigarettes in life, but does not currently smoke
+#   Current smoker:
+#     - smoked at least 100 cigarettes in life and currently smokes every day
+#       or some days
+#
+# Core variables:
+#   SMQ020:
+#     Smoked at least 100 cigarettes in life
+#     1 = Yes
+#     2 = No
+#     7 = Refused
+#     9 = Don't know
+#
+#   SMQ040:
+#     Do you now smoke cigarettes?
+#     1 = Every day
+#     2 = Some days
+#     3 = Not at all
+#     7 = Refused
+#     9 = Don't know
+#
+# Data Cycles:
+#   - 2017-March 2020: P_SMQ
+#   - 2021-2023: SMQ_L
+#
+# Output:
+#   - D:/code/4.data.rds
+################################################################################
+
+# 1. Libraries -----------------------------------------------------------------
+
+library(nhanesA)
+library(tidyverse)
+
+# 2. Environment ---------------------------------------------------------------
+
+export_dir <- "D:/code"
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = TRUE)
+}
+
+qc_dir <- file.path(export_dir, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 3. Helper Functions ----------------------------------------------------------
+
+clean_smq_code <- function(x, valid_values) {
+  x <- suppressWarnings(as.numeric(x))
+  
+  case_when(
+    is.na(x) ~ NA_real_,
+    x %in% valid_values ~ x,
+    TRUE ~ NA_real_
+  )
+}
+
+process_smoking_cycle <- function(table_name, cycle_label) {
+  
+  cat("Processing smoking data:", cycle_label, "\n")
+  
+  raw_data <- nhanes(table_name)
+  
+  required_vars <- c("SEQN", "SMQ020", "SMQ040")
+  
+  missing_vars <- setdiff(required_vars, names(raw_data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required smoking variables in ",
+      table_name,
+      ": ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  processed <- raw_data %>%
+    as_tibble() %>%
+    select(all_of(required_vars)) %>%
+    mutate(
+      SEQN = suppressWarnings(as.numeric(SEQN)),
+      
+      SMQ020_raw = SMQ020,
+      SMQ040_raw = SMQ040,
+      
+      SMQ020 = clean_smq_code(SMQ020, valid_values = c(1, 2)),
+      SMQ040 = clean_smq_code(SMQ040, valid_values = c(1, 2, 3)),
+      
+      smoked_100_cigarettes = case_when(
+        SMQ020 == 1 ~ 1,
+        SMQ020 == 2 ~ 0,
+        TRUE        ~ NA_real_
+      ),
+      
+      # This variable is meaningful only among participants who smoked
+      # at least 100 cigarettes in life.
+      current_smoking_now_among_ever_smokers = case_when(
+        SMQ020 == 1 & SMQ040 %in% c(1, 2) ~ 1,
+        SMQ020 == 1 & SMQ040 == 3         ~ 0,
+        SMQ020 == 1 & is.na(SMQ040)       ~ NA_real_,
+        TRUE                              ~ NA_real_
+      ),
+      
+      smoke_status = case_when(
+        # Never smoker
+        SMQ020 == 2 ~ 0,
+        
+        # Former smoker
+        SMQ020 == 1 & SMQ040 == 3 ~ 1,
+        
+        # Current smoker
+        SMQ020 == 1 & SMQ040 %in% c(1, 2) ~ 2,
+        
+        TRUE ~ NA_real_
+      ),
+      
+      smoke_status_label = factor(
+        smoke_status,
+        levels = c(0, 1, 2),
+        labels = c(
+          "Never",
+          "Former",
+          "Current"
+        )
+      ),
+      
+      # Backward-compatible names used in older scripts
+      smoke_label = smoke_status_label,
+      smoke_status_num = smoke_status,
+      
+      CYCLE = cycle_label
+    )
+  
+  return(processed)
+}
+
+# 4. Process Cycles ------------------------------------------------------------
+
+smoke_1720 <- process_smoking_cycle("P_SMQ", "2017-2020")
+smoke_2123 <- process_smoking_cycle("SMQ_L", "2021-2023")
+
+smoke_final <- bind_rows(smoke_1720, smoke_2123)
+
+# 5. Quality Control -----------------------------------------------------------
+
+cat("\n--- Smoking Status Distribution by Cycle ---\n")
+
+smoke_dist_cycle <- smoke_final %>%
+  count(CYCLE, smoke_status_label, name = "n") %>%
+  arrange(CYCLE, smoke_status_label)
+
+print(smoke_dist_cycle)
+
+cat("\n--- Smoking Status Overall Distribution ---\n")
+
+smoke_dist_overall <- smoke_final %>%
+  count(smoke_status_label, name = "n") %>%
+  arrange(smoke_status_label)
+
+print(smoke_dist_overall)
+
+cat("\n--- Missingness Audit ---\n")
+
+missing_audit <- smoke_final %>%
+  summarise(
+    n_total = n(),
+    
+    missing_SMQ020 = sum(is.na(SMQ020)),
+    
+    # SMQ040 is only structurally meaningful among ever smokers.
+    # Never smokers are not counted as missing for current-smoking status.
+    n_ever_smokers = sum(SMQ020 == 1, na.rm = TRUE),
+    
+    missing_SMQ040_among_ever_smokers =
+      sum(SMQ020 == 1 & is.na(SMQ040), na.rm = TRUE),
+    
+    missing_smoked_100_cigarettes =
+      sum(is.na(smoked_100_cigarettes)),
+    
+    missing_current_smoking_now_among_ever_smokers =
+      sum(SMQ020 == 1 & is.na(current_smoking_now_among_ever_smokers), na.rm = TRUE),
+    
+    missing_smoke_status =
+      sum(is.na(smoke_status_label))
+  )
+
+print(missing_audit)
+
+cat("\n--- Cross-tab: SMQ020 x SMQ040 x Smoking Status ---\n")
+
+cross_tab <- smoke_final %>%
+  count(SMQ020, SMQ040, smoke_status_label, name = "n") %>%
+  arrange(SMQ020, SMQ040, smoke_status_label)
+
+print(cross_tab)
+
+cat("\n--- Cycle-specific Missingness Audit ---\n")
+
+missing_audit_cycle <- smoke_final %>%
+  group_by(CYCLE) %>%
+  summarise(
+    n_total = n(),
+    
+    missing_SMQ020 = sum(is.na(SMQ020)),
+    
+    n_ever_smokers = sum(SMQ020 == 1, na.rm = TRUE),
+    
+    missing_SMQ040_among_ever_smokers =
+      sum(SMQ020 == 1 & is.na(SMQ040), na.rm = TRUE),
+    
+    missing_smoke_status =
+      sum(is.na(smoke_status_label)),
+    
+    .groups = "drop"
+  )
+
+print(missing_audit_cycle)
+
+# 6. Save QC Outputs -----------------------------------------------------------
+
+write_csv(
+  smoke_dist_cycle,
+  file.path(qc_dir, "Step4_smoking_status_distribution_by_cycle.csv")
+)
+
+write_csv(
+  smoke_dist_overall,
+  file.path(qc_dir, "Step4_smoking_status_distribution_overall.csv")
+)
+
+write_csv(
+  missing_audit,
+  file.path(qc_dir, "Step4_smoking_missingness_audit.csv")
+)
+
+write_csv(
+  missing_audit_cycle,
+  file.path(qc_dir, "Step4_smoking_missingness_audit_by_cycle.csv")
+)
+
+write_csv(
+  cross_tab,
+  file.path(qc_dir, "Step4_smoking_SMQ020_SMQ040_crosstab.csv")
+)
+
+# 7. Export --------------------------------------------------------------------
+
+save_path <- file.path(export_dir, "4.data.rds")
+
+saveRDS(smoke_final, save_path)
+
+cat("\nProcessing complete. Dataset saved to:", save_path, "\n")
+cat("QC files saved to:", qc_dir, "\n")
+cat(
+  "Final Dataset dimensions:",
+  dim(smoke_final)[1],
+  "rows and",
+  dim(smoke_final)[2],
+  "variables.\n"
+)
