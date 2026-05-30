@@ -1,0 +1,302 @@
+################################################################################
+# Script Name: 2. PHQ-9 Depression Data Processing (NHANES 2017-2023)
+# Purpose:
+#   Extract, clean, recode PHQ-9 items, and calculate depression outcomes.
+#
+# Manuscript-consistent version:
+#   Main outcome:
+#     - PHQ-9 >= 10
+#
+#   Sensitivity outcomes:
+#     - PHQ-9 >= 15
+#     - Modified PHQ-9 score excluding item 3 / DPQ030 >= 10
+#     - Modified PHQ-9 score excluding item 3 / DPQ030 >= 9
+#     - Exclusion flag for daily suicidal ideation, DPQ090 == 3 after recoding
+#
+# Data Cycles:
+#   - 2017-March 2020: P_DPQ
+#   - 2021-2023: DPQ_L
+#
+# Output:
+#   - D:/code/2.data.rds
+################################################################################
+
+library(nhanesA)
+library(tidyverse)
+
+export_dir <- "D:/code"
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = TRUE)
+}
+
+qc_dir <- file.path(export_dir, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+recode_phq <- function(x) {
+  x <- as.numeric(x)
+  
+  case_when(
+    x == 1 ~ 0,
+    x == 2 ~ 1,
+    x == 3 ~ 2,
+    x == 4 ~ 3,
+    TRUE   ~ NA_real_
+  )
+}
+
+process_phq_cycle <- function(table_name, cycle_label) {
+  
+  cat("Processing Cycle:", cycle_label, "...\n")
+  
+  raw_data <- nhanes(table_name)
+  
+  required_vars <- c(
+    "SEQN",
+    "DPQ010", "DPQ020", "DPQ030", "DPQ040", "DPQ050",
+    "DPQ060", "DPQ070", "DPQ080", "DPQ090"
+  )
+  
+  missing_vars <- setdiff(required_vars, names(raw_data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required PHQ variables in ",
+      table_name,
+      ": ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  processed <- raw_data %>%
+    select(all_of(required_vars)) %>%
+    mutate(SEQN = as.numeric(SEQN)) %>%
+    mutate(
+      across(
+        DPQ010:DPQ090,
+        ~ recode_phq(.)
+      )
+    ) %>%
+    mutate(
+      PHQ9_ITEM_MISSING_N = rowSums(
+        is.na(select(., DPQ010:DPQ090))
+      ),
+      
+      PHQ9_SCORE = ifelse(
+        PHQ9_ITEM_MISSING_N == 0,
+        rowSums(select(., DPQ010:DPQ090)),
+        NA_real_
+      ),
+      
+      # Modified PHQ-9 score excluding item 3 / DPQ030.
+      # This sensitivity outcome reduces overlap between sleep-related
+      # exposures and the sleep symptom item in PHQ-9.
+      PHQ9_no_sleep_ITEM_MISSING_N = rowSums(
+        is.na(select(., DPQ010, DPQ020, DPQ040:DPQ090))
+      ),
+      
+      PHQ9_no_sleep_SCORE = ifelse(
+        PHQ9_no_sleep_ITEM_MISSING_N == 0,
+        rowSums(select(., DPQ010, DPQ020, DPQ040:DPQ090)),
+        NA_real_
+      ),
+      
+      # Main outcome
+      PHQ9_depression_above_10 = case_when(
+        PHQ9_SCORE >= 10 ~ 1,
+        PHQ9_SCORE < 10  ~ 0,
+        TRUE             ~ NA_real_
+      ),
+      
+      # Backward-compatible variable name
+      Moderate_depression_above = PHQ9_depression_above_10,
+      
+      # Sensitivity outcome: stricter PHQ-9 threshold
+      PHQ9_depression_above_15 = case_when(
+        PHQ9_SCORE >= 15 ~ 1,
+        PHQ9_SCORE < 15  ~ 0,
+        TRUE             ~ NA_real_
+      ),
+      
+      # Backward-compatible variable name
+      ModSevere_depression_above = PHQ9_depression_above_15,
+      
+      # Sensitivity outcome: modified PHQ-9 excluding item 3, threshold >=10
+      PHQ9_no_sleep_depression_above_10 = case_when(
+        PHQ9_no_sleep_SCORE >= 10 ~ 1,
+        PHQ9_no_sleep_SCORE < 10  ~ 0,
+        TRUE                      ~ NA_real_
+      ),
+      
+      # Sensitivity outcome: modified PHQ-9 excluding item 3, threshold >=9
+      PHQ9_no_sleep_depression_above_9 = case_when(
+        PHQ9_no_sleep_SCORE >= 9 ~ 1,
+        PHQ9_no_sleep_SCORE < 9  ~ 0,
+        TRUE                     ~ NA_real_
+      ),
+      
+      suicidal_ideation_any = case_when(
+        DPQ090 >= 1 ~ 1,
+        DPQ090 == 0 ~ 0,
+        TRUE        ~ NA_real_
+      ),
+      
+      suicidal_ideation_daily = case_when(
+        DPQ090 == 3 ~ 1,
+        DPQ090 < 3  ~ 0,
+        TRUE        ~ NA_real_
+      ),
+      
+      PHQ9_Category_Num = case_when(
+        PHQ9_SCORE >= 20 ~ 5,
+        PHQ9_SCORE >= 15 ~ 4,
+        PHQ9_SCORE >= 10 ~ 3,
+        PHQ9_SCORE >= 5  ~ 2,
+        PHQ9_SCORE >= 1  ~ 1,
+        PHQ9_SCORE == 0  ~ 0,
+        TRUE             ~ NA_real_
+      ),
+      
+      PHQ9_Category = factor(
+        case_when(
+          PHQ9_SCORE >= 20 ~ "Severe",
+          PHQ9_SCORE >= 15 ~ "Moderately severe",
+          PHQ9_SCORE >= 10 ~ "Moderate",
+          PHQ9_SCORE >= 5  ~ "Mild",
+          PHQ9_SCORE >= 1  ~ "Minimal",
+          PHQ9_SCORE == 0  ~ "None",
+          TRUE             ~ NA_character_
+        ),
+        levels = c(
+          "None",
+          "Minimal",
+          "Mild",
+          "Moderate",
+          "Moderately severe",
+          "Severe"
+        )
+      ),
+      
+      CYCLE = cycle_label
+    )
+  
+  return(processed)
+}
+
+phq_1720 <- process_phq_cycle("P_DPQ", "2017-2020")
+phq_2123 <- process_phq_cycle("DPQ_L", "2021-2023")
+
+phq_combined <- bind_rows(phq_1720, phq_2123)
+
+cat("\n--- Basic QC ---\n")
+cat("Total PHQ records:", nrow(phq_combined), "\n")
+cat("2017-2020 PHQ records:", sum(phq_combined$CYCLE == "2017-2020"), "\n")
+cat("2021-2023 PHQ records:", sum(phq_combined$CYCLE == "2021-2023"), "\n")
+
+cat("\n--- Descriptive Summary of PHQ-9 Scores ---\n")
+print(summary(phq_combined$PHQ9_SCORE))
+
+cat("\n--- Descriptive Summary of Modified PHQ-9 Scores, Item 3 Removed ---\n")
+print(summary(phq_combined$PHQ9_no_sleep_SCORE))
+
+missing_audit <- phq_combined %>%
+  summarise(
+    n_total = n(),
+    
+    missing_phq9_score = sum(is.na(PHQ9_SCORE)),
+    missing_phq9_no_sleep_score = sum(is.na(PHQ9_no_sleep_SCORE)),
+    
+    missing_phq9_main_outcome = sum(is.na(PHQ9_depression_above_10)),
+    missing_phq9_15_outcome = sum(is.na(PHQ9_depression_above_15)),
+    missing_phq9_no_sleep_10_outcome =
+      sum(is.na(PHQ9_no_sleep_depression_above_10)),
+    missing_phq9_no_sleep_9_outcome =
+      sum(is.na(PHQ9_no_sleep_depression_above_9)),
+    
+    missing_suicidal_ideation_daily =
+      sum(is.na(suicidal_ideation_daily))
+  )
+
+cat("\n--- Missingness Audit ---\n")
+print(missing_audit)
+
+phq9_10_dist <- phq_combined %>%
+  count(PHQ9_depression_above_10, name = "n")
+
+phq9_15_dist <- phq_combined %>%
+  count(PHQ9_depression_above_15, name = "n")
+
+phq9_no_sleep_10_dist <- phq_combined %>%
+  count(PHQ9_no_sleep_depression_above_10, name = "n")
+
+phq9_no_sleep_9_dist <- phq_combined %>%
+  count(PHQ9_no_sleep_depression_above_9, name = "n")
+
+suicidal_daily_dist <- phq_combined %>%
+  count(suicidal_ideation_daily, name = "n")
+
+phq9_category_dist <- phq_combined %>%
+  count(PHQ9_Category, name = "n")
+
+cat("\n--- Distribution of Main Outcome: PHQ-9 >= 10 ---\n")
+print(phq9_10_dist)
+
+cat("\n--- Distribution of Sensitivity Outcome: PHQ-9 >= 15 ---\n")
+print(phq9_15_dist)
+
+cat("\n--- Distribution of Sensitivity Outcome: Modified PHQ-9 excluding item 3 >= 10 ---\n")
+print(phq9_no_sleep_10_dist)
+
+cat("\n--- Distribution of Sensitivity Outcome: Modified PHQ-9 excluding item 3 >= 9 ---\n")
+print(phq9_no_sleep_9_dist)
+
+cat("\n--- Distribution of Daily Suicidal Ideation ---\n")
+print(suicidal_daily_dist)
+
+cat("\n--- PHQ-9 Severity Category Distribution ---\n")
+print(phq9_category_dist)
+
+write_csv(
+  missing_audit,
+  file.path(qc_dir, "Step2_PHQ_missingness_audit.csv")
+)
+
+write_csv(
+  phq9_10_dist,
+  file.path(qc_dir, "Step2_PHQ9_ge10_distribution.csv")
+)
+
+write_csv(
+  phq9_15_dist,
+  file.path(qc_dir, "Step2_PHQ9_ge15_distribution.csv")
+)
+
+write_csv(
+  phq9_no_sleep_10_dist,
+  file.path(qc_dir, "Step2_PHQ9_no_sleep_ge10_distribution.csv")
+)
+
+write_csv(
+  phq9_no_sleep_9_dist,
+  file.path(qc_dir, "Step2_PHQ9_no_sleep_ge9_distribution.csv")
+)
+
+write_csv(
+  suicidal_daily_dist,
+  file.path(qc_dir, "Step2_suicidal_ideation_daily_distribution.csv")
+)
+
+write_csv(
+  phq9_category_dist,
+  file.path(qc_dir, "Step2_PHQ9_category_distribution.csv")
+)
+
+export_path <- file.path(export_dir, "2.data.rds")
+
+saveRDS(phq_combined, export_path)
+
+cat("\nProcess Complete. Dataset saved to:", export_path, "\n")
+cat("QC files saved to:", qc_dir, "\n")
