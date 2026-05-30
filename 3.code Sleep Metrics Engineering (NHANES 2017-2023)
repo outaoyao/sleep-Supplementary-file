@@ -1,0 +1,400 @@
+################################################################################
+# Script Name: 3. Sleep Metrics Engineering (NHANES 2017-2023)
+# Purpose:
+#   Clean NHANES sleep variables and derive weekday/weekend sleep timing metrics.
+#
+# Manuscript-consistent version:
+#   - Do NOT delete participants in Step 3.
+#   - Treat NHANES special codes such as refused / don't know as missing.
+#   - Retain raw sleep duration.
+#   - Winsorize extreme sleep duration values to 3-14 hours.
+#   - Create QC flags for implausible duration values.
+#   - Derive sleep onset, wake time, midpoint, SJL, and WCS.
+#
+# Data Cycles:
+#   - 2017-March 2020: P_SLQ
+#   - 2021-2023: SLQ_L
+#
+# Output:
+#   - D:/code/3.data.rds
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+
+library(nhanesA)
+library(tidyverse)
+library(stringr)
+
+export_dir <- "D:/code"
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = TRUE)
+}
+
+qc_dir <- file.path(export_dir, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 2. Helper Functions ----------------------------------------------------------
+
+clean_special_codes <- function(x) {
+  x_chr <- as.character(x)
+  x_chr <- str_trim(x_chr)
+  
+  case_when(
+    is.na(x_chr) ~ NA_character_,
+    x_chr %in% c(
+      "",
+      ".",
+      "777",
+      "999",
+      "7777",
+      "9999",
+      "77777",
+      "99999",
+      "Refused",
+      "Don't know",
+      "Don't Know",
+      "DK",
+      "NA"
+    ) ~ NA_character_,
+    TRUE ~ x_chr
+  )
+}
+
+safe_numeric <- function(x) {
+  suppressWarnings(as.numeric(clean_special_codes(x)))
+}
+
+winsorize_duration <- function(x, lower = 3, upper = 14) {
+  x <- as.numeric(x)
+  
+  case_when(
+    is.na(x) ~ NA_real_,
+    x < lower ~ lower,
+    x > upper ~ upper,
+    TRUE ~ x
+  )
+}
+
+time_to_min <- function(time_str) {
+  time_chr <- clean_special_codes(time_str)
+  
+  # If already numeric HHMM format, convert to 4-digit character.
+  # If character HH:MM format, keep as is.
+  time_chr <- case_when(
+    is.na(time_chr) ~ NA_character_,
+    
+    str_detect(time_chr, "^\\d{1,2}:\\d{2}$") ~ time_chr,
+    
+    str_detect(time_chr, "^\\d{3,4}$") ~ {
+      padded <- str_pad(time_chr, width = 4, pad = "0")
+      paste0(str_sub(padded, 1, 2), ":", str_sub(padded, 3, 4))
+    },
+    
+    TRUE ~ NA_character_
+  )
+  
+  parts <- str_split_fixed(time_chr, ":", 2)
+  
+  h <- suppressWarnings(as.numeric(parts[, 1]))
+  m <- suppressWarnings(as.numeric(parts[, 2]))
+  
+  total <- h * 60 + m
+  
+  # Normalize 24:00 to 00:00
+  total <- if_else(total == 1440, 0, total)
+  
+  if_else(
+    !is.na(total) & total >= 0 & total < 1440 & m >= 0 & m < 60,
+    total,
+    NA_real_
+  )
+}
+
+calc_midpoint <- function(sleep_time_str, wake_time_str) {
+  s <- time_to_min(sleep_time_str)
+  w <- time_to_min(wake_time_str)
+  
+  mid <- case_when(
+    is.na(s) | is.na(w) ~ NA_real_,
+    w >= s ~ s + (w - s) / 2,
+    w < s  ~ s + (1440 + w - s) / 2,
+    TRUE   ~ NA_real_
+  )
+  
+  if_else(mid >= 1440, mid - 1440, mid)
+}
+
+min_to_hour_decimal <- function(x) {
+  x / 60
+}
+
+min_to_hhmm <- function(x) {
+  ifelse(
+    is.na(x),
+    NA_character_,
+    sprintf(
+      "%02d:%02d",
+      floor(x / 60),
+      round(x %% 60)
+    )
+  )
+}
+
+# 3. Download Raw Sleep Data ---------------------------------------------------
+
+cat("Downloading NHANES sleep data...\n")
+
+s_1720_raw <- nhanes("P_SLQ")
+s_2123_raw <- nhanes("SLQ_L")
+
+# 4. Process One Cycle ---------------------------------------------------------
+
+process_sleep_cycle <- function(raw_data, cycle_label) {
+  
+  cat("Processing sleep cycle:", cycle_label, "\n")
+  
+  required_vars <- c(
+    "SEQN",
+    "SLD012", "SLD013",
+    "SLQ300", "SLQ310", "SLQ320", "SLQ330"
+  )
+  
+  missing_vars <- setdiff(required_vars, names(raw_data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required sleep variables in ",
+      cycle_label,
+      ": ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  processed <- raw_data %>%
+    select(any_of(names(raw_data))) %>%
+    mutate(
+      SEQN = safe_numeric(SEQN),
+      CYCLE = cycle_label
+    ) %>%
+    mutate(
+      # Retain raw duration before cleaning
+      dur_wd_raw = safe_numeric(SLD012),
+      dur_we_raw = safe_numeric(SLD013),
+      
+      # Special-code-cleaned raw timing strings
+      sleep_onset_wd_raw = clean_special_codes(SLQ300),
+      wake_time_wd_raw   = clean_special_codes(SLQ310),
+      sleep_onset_we_raw = clean_special_codes(SLQ320),
+      wake_time_we_raw   = clean_special_codes(SLQ330),
+      
+      # Implausible-duration flags before winsorization
+      dur_wd_implausible_flag = case_when(
+        is.na(dur_wd_raw) ~ NA_real_,
+        dur_wd_raw < 3 | dur_wd_raw > 14 ~ 1,
+        TRUE ~ 0
+      ),
+      
+      dur_we_implausible_flag = case_when(
+        is.na(dur_we_raw) ~ NA_real_,
+        dur_we_raw < 3 | dur_we_raw > 14 ~ 1,
+        TRUE ~ 0
+      ),
+      
+      # Manuscript-consistent analytic duration:
+      # extreme values are truncated to boundaries rather than deleted.
+      dur_wd = winsorize_duration(dur_wd_raw, lower = 3, upper = 14),
+      dur_we = winsorize_duration(dur_we_raw, lower = 3, upper = 14),
+      
+      # Timing variables in minutes since midnight
+      sleep_onset_wd_min = time_to_min(sleep_onset_wd_raw),
+      wake_time_wd_min   = time_to_min(wake_time_wd_raw),
+      sleep_onset_we_min = time_to_min(sleep_onset_we_raw),
+      wake_time_we_min   = time_to_min(wake_time_we_raw),
+      
+      # Timing variables as decimal hours for modeling / plotting
+      sleep_onset_wd_hour = min_to_hour_decimal(sleep_onset_wd_min),
+      wake_time_wd_hour   = min_to_hour_decimal(wake_time_wd_min),
+      sleep_onset_we_hour = min_to_hour_decimal(sleep_onset_we_min),
+      wake_time_we_hour   = min_to_hour_decimal(wake_time_we_min),
+      
+      # Midpoints
+      midpoint_wd_min = calc_midpoint(sleep_onset_wd_raw, wake_time_wd_raw),
+      midpoint_we_min = calc_midpoint(sleep_onset_we_raw, wake_time_we_raw),
+      
+      midpoint_wd_hour = min_to_hour_decimal(midpoint_wd_min),
+      midpoint_we_hour = min_to_hour_decimal(midpoint_we_min),
+      
+      midpoint_wd_hhmm = min_to_hhmm(midpoint_wd_min),
+      midpoint_we_hhmm = min_to_hhmm(midpoint_we_min),
+      
+      # Social jetlag
+      SJL_raw_min = midpoint_we_min - midpoint_wd_min,
+      
+      SJL_raw_min = case_when(
+        is.na(SJL_raw_min) ~ NA_real_,
+        SJL_raw_min > 720  ~ SJL_raw_min - 1440,
+        SJL_raw_min < -720 ~ SJL_raw_min + 1440,
+        TRUE ~ SJL_raw_min
+      ),
+      
+      SJL_abs_min = abs(SJL_raw_min),
+      SJL_abs_hour = SJL_abs_min / 60,
+      
+      # Weekend catch-up sleep
+      WCS_raw_hour = dur_we - dur_wd,
+      WCS_abs_hour = abs(WCS_raw_hour),
+      
+      # Sleep duration categories
+      dur_wd_cat = case_when(
+        is.na(dur_wd) ~ NA_character_,
+        dur_wd < 7 ~ "<7 hours",
+        dur_wd >= 7 & dur_wd < 9 ~ "7-9 hours",
+        dur_wd >= 9 ~ "≥9 hours",
+        TRUE ~ NA_character_
+      ),
+      
+      dur_we_cat = case_when(
+        is.na(dur_we) ~ NA_character_,
+        dur_we < 7 ~ "<7 hours",
+        dur_we >= 7 & dur_we < 9 ~ "7-9 hours",
+        dur_we >= 9 ~ "≥9 hours",
+        TRUE ~ NA_character_
+      ),
+      
+      dur_wd_cat = factor(
+        dur_wd_cat,
+        levels = c("7-9 hours", "<7 hours", "≥9 hours")
+      ),
+      
+      dur_we_cat = factor(
+        dur_we_cat,
+        levels = c("7-9 hours", "<7 hours", "≥9 hours")
+      ),
+      
+      dur_wd_cat_num = as.numeric(dur_wd_cat),
+      dur_we_cat_num = as.numeric(dur_we_cat)
+    )
+  
+  return(processed)
+}
+
+# 5. Process and Merge ---------------------------------------------------------
+
+sleep_1720 <- process_sleep_cycle(s_1720_raw, "2017-2020")
+sleep_2123 <- process_sleep_cycle(s_2123_raw, "2021-2023")
+
+sleep_processed <- bind_rows(sleep_1720, sleep_2123)
+
+# 6. QC ------------------------------------------------------------------------
+
+cat("\n--- Basic Sleep QC ---\n")
+cat("Total sleep records:", nrow(sleep_processed), "\n")
+cat("2017-2020 sleep records:", sum(sleep_processed$CYCLE == "2017-2020"), "\n")
+cat("2021-2023 sleep records:", sum(sleep_processed$CYCLE == "2021-2023"), "\n")
+
+missing_audit <- sleep_processed %>%
+  summarise(
+    n_total = n(),
+    
+    missing_dur_wd_raw = sum(is.na(dur_wd_raw)),
+    missing_dur_we_raw = sum(is.na(dur_we_raw)),
+    
+    missing_dur_wd = sum(is.na(dur_wd)),
+    missing_dur_we = sum(is.na(dur_we)),
+    
+    n_dur_wd_implausible = sum(dur_wd_implausible_flag == 1, na.rm = TRUE),
+    n_dur_we_implausible = sum(dur_we_implausible_flag == 1, na.rm = TRUE),
+    
+    missing_sleep_onset_wd = sum(is.na(sleep_onset_wd_min)),
+    missing_wake_time_wd = sum(is.na(wake_time_wd_min)),
+    missing_sleep_onset_we = sum(is.na(sleep_onset_we_min)),
+    missing_wake_time_we = sum(is.na(wake_time_we_min)),
+    
+    missing_midpoint_wd = sum(is.na(midpoint_wd_min)),
+    missing_midpoint_we = sum(is.na(midpoint_we_min)),
+    
+    missing_SJL = sum(is.na(SJL_abs_hour)),
+    missing_WCS = sum(is.na(WCS_abs_hour))
+  )
+
+cat("\n--- Missingness / Implausible Value Audit ---\n")
+print(missing_audit)
+
+range_qc <- sleep_processed %>%
+  summarise(
+    min_dur_wd_raw = min(dur_wd_raw, na.rm = TRUE),
+    max_dur_wd_raw = max(dur_wd_raw, na.rm = TRUE),
+    min_dur_we_raw = min(dur_we_raw, na.rm = TRUE),
+    max_dur_we_raw = max(dur_we_raw, na.rm = TRUE),
+    
+    min_dur_wd_winsorized = min(dur_wd, na.rm = TRUE),
+    max_dur_wd_winsorized = max(dur_wd, na.rm = TRUE),
+    min_dur_we_winsorized = min(dur_we, na.rm = TRUE),
+    max_dur_we_winsorized = max(dur_we, na.rm = TRUE),
+    
+    min_onset_wd_hour = min(sleep_onset_wd_hour, na.rm = TRUE),
+    max_onset_wd_hour = max(sleep_onset_wd_hour, na.rm = TRUE),
+    min_wake_wd_hour = min(wake_time_wd_hour, na.rm = TRUE),
+    max_wake_wd_hour = max(wake_time_wd_hour, na.rm = TRUE),
+    
+    min_midpoint_wd_hour = min(midpoint_wd_hour, na.rm = TRUE),
+    max_midpoint_wd_hour = max(midpoint_wd_hour, na.rm = TRUE),
+    min_midpoint_we_hour = min(midpoint_we_hour, na.rm = TRUE),
+    max_midpoint_we_hour = max(midpoint_we_hour, na.rm = TRUE),
+    
+    max_SJL_abs_hour = max(SJL_abs_hour, na.rm = TRUE),
+    max_WCS_abs_hour = max(WCS_abs_hour, na.rm = TRUE)
+  )
+
+cat("\n--- Range QC ---\n")
+print(range_qc)
+
+duration_category_qc <- sleep_processed %>%
+  summarise(
+    weekday_7_9 = sum(dur_wd_cat == "7-9 hours", na.rm = TRUE),
+    weekday_lt7 = sum(dur_wd_cat == "<7 hours", na.rm = TRUE),
+    weekday_ge9 = sum(dur_wd_cat == "≥9 hours", na.rm = TRUE),
+    weekend_7_9 = sum(dur_we_cat == "7-9 hours", na.rm = TRUE),
+    weekend_lt7 = sum(dur_we_cat == "<7 hours", na.rm = TRUE),
+    weekend_ge9 = sum(dur_we_cat == "≥9 hours", na.rm = TRUE)
+  )
+
+cat("\n--- Sleep Duration Category QC ---\n")
+print(duration_category_qc)
+
+# 7. Save QC Outputs -----------------------------------------------------------
+
+write_csv(
+  missing_audit,
+  file.path(qc_dir, "Step3_sleep_missingness_implausible_audit.csv")
+)
+
+write_csv(
+  range_qc,
+  file.path(qc_dir, "Step3_sleep_range_qc.csv")
+)
+
+write_csv(
+  duration_category_qc,
+  file.path(qc_dir, "Step3_sleep_duration_category_qc.csv")
+)
+
+# 8. Export --------------------------------------------------------------------
+
+save_path <- file.path(export_dir, "3.data.rds")
+
+saveRDS(sleep_processed, save_path)
+
+cat("\nProcessing complete. Dataset saved to:", save_path, "\n")
+cat("QC files saved to:", qc_dir, "\n")
+cat(
+  "Final Dataset dimensions:",
+  dim(sleep_processed)[1],
+  "rows and",
+  dim(sleep_processed)[2],
+  "variables.\n"
+)
