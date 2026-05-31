@@ -1,0 +1,567 @@
+################################################################################
+# Script Name: 10. Physical Activity & Sedentary Behavior
+# Purpose:
+#   Harmonize NHANES recreational physical activity and sedentary behavior
+#   across 2017-2023 cycles.
+#
+# Manuscript-consistent variables:
+#   - MET_total: recreational MET-min/week
+#   - MET_cat_label: Low / Moderate / High
+#   - sedentary_min: sedentary minutes/day
+#   - sedentary_cat_label: <6h / 6-8h / >8h
+#
+# Cleaning principles:
+#   - Refused / Don't know / missing codes are treated as missing
+#   - MET_total is truncated at 30,000 MET-min/week
+#   - Sedentary time is truncated at 960 min/day (16 h/day)
+#   - Truncation is performed before categorization
+#   - Participants are not deleted in this step
+#
+# Data Cycles:
+#   - 2017-March 2020: P_PAQ
+#   - 2021-2023: PAQ_L
+#
+# Output:
+#   - D:/code/10.data.rds
+################################################################################
+
+# 1. Libraries -----------------------------------------------------------------
+
+library(nhanesA)
+library(tidyverse)
+library(stringr)
+
+# 2. Environment ---------------------------------------------------------------
+
+export_dir <- "D:/code"
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = TRUE)
+}
+
+qc_dir <- file.path(export_dir, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 3. Helper Functions ----------------------------------------------------------
+
+clean_numeric_code <- function(x) {
+  
+  x_chr <- as.character(x)
+  x_chr <- str_trim(x_chr)
+  x_low <- str_to_lower(x_chr)
+  
+  case_when(
+    is.na(x_chr) ~ NA_real_,
+    
+    x_low %in% c(
+      "",
+      ".",
+      "7",
+      "9",
+      "77",
+      "99",
+      "777",
+      "999",
+      "7777",
+      "9999",
+      "77777",
+      "99999",
+      "refused",
+      "don't know",
+      "dont know",
+      "missing",
+      "na"
+    ) ~ NA_real_,
+    
+    TRUE ~ suppressWarnings(as.numeric(x_chr))
+  )
+}
+
+clean_yes_no_code <- function(x) {
+  
+  x_chr <- as.character(x)
+  x_chr <- str_trim(x_chr)
+  x_low <- str_to_lower(x_chr)
+  
+  case_when(
+    is.na(x_chr) ~ NA_real_,
+    
+    x_chr == "1" ~ 1,
+    x_chr == "2" ~ 2,
+    
+    x_low == "yes" ~ 1,
+    x_low == "no"  ~ 2,
+    
+    x_low %in% c(
+      "",
+      ".",
+      "7",
+      "9",
+      "77",
+      "99",
+      "refused",
+      "don't know",
+      "dont know",
+      "missing",
+      "na"
+    ) ~ NA_real_,
+    
+    TRUE ~ NA_real_
+  )
+}
+
+clean_frequency_unit <- function(x) {
+  
+  x_chr <- as.character(x)
+  x_chr <- str_trim(x_chr)
+  x_low <- str_to_lower(x_chr)
+  
+  case_when(
+    is.na(x_chr) ~ NA_character_,
+    
+    x_low %in% c(
+      "",
+      ".",
+      "7",
+      "9",
+      "77",
+      "99",
+      "refused",
+      "don't know",
+      "dont know",
+      "missing",
+      "na"
+    ) ~ NA_character_,
+    
+    x_low %in% c("day", "d", "1") ~ "Day",
+    x_low %in% c("week", "w", "2") ~ "Week",
+    x_low %in% c("month", "m", "3") ~ "Month",
+    x_low %in% c("year", "y", "4") ~ "Year",
+    
+    str_detect(x_low, "day") ~ "Day",
+    str_detect(x_low, "week") ~ "Week",
+    str_detect(x_low, "month") ~ "Month",
+    str_detect(x_low, "year") ~ "Year",
+    
+    TRUE ~ NA_character_
+  )
+}
+
+unit_to_week_multiplier <- function(unit_chr) {
+  case_when(
+    unit_chr == "Day"   ~ 7,
+    unit_chr == "Week"  ~ 1,
+    unit_chr == "Month" ~ 1 / 4.345,
+    unit_chr == "Year"  ~ 1 / 52.18,
+    TRUE                ~ NA_real_
+  )
+}
+
+truncate_upper <- function(x, upper) {
+  case_when(
+    is.na(x) ~ NA_real_,
+    x > upper ~ upper,
+    TRUE ~ x
+  )
+}
+
+# 4. Data Acquisition ----------------------------------------------------------
+
+cat("Downloading NHANES physical activity data...\n")
+
+p_paq <- nhanes("P_PAQ")
+paq_l <- nhanes("PAQ_L")
+
+# 5. Process 2017-March 2020 ---------------------------------------------------
+
+process_paq_1720 <- function(raw_data) {
+  
+  cat("Processing PAQ cycle: 2017-2020\n")
+  
+  required_vars <- c(
+    "SEQN",
+    "PAQ650", "PAQ655", "PAD660",
+    "PAQ665", "PAQ670", "PAD675",
+    "PAD680"
+  )
+  
+  missing_vars <- setdiff(required_vars, names(raw_data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required PAQ variables in 2017-2020: ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  cat("\nRaw PAQ650 distribution, 2017-2020:\n")
+  print(table(raw_data$PAQ650, useNA = "ifany"))
+  
+  cat("\nRaw PAQ665 distribution, 2017-2020:\n")
+  print(table(raw_data$PAQ665, useNA = "ifany"))
+  
+  processed <- raw_data %>%
+    as_tibble() %>%
+    select(all_of(required_vars)) %>%
+    mutate(
+      SEQN = clean_numeric_code(SEQN),
+      
+      PAQ650_raw = PAQ650,
+      PAQ655_raw = PAQ655,
+      PAD660_raw = PAD660,
+      
+      PAQ665_raw = PAQ665,
+      PAQ670_raw = PAQ670,
+      PAD675_raw = PAD675,
+      
+      PAD680_raw = PAD680,
+      
+      PAQ650 = clean_yes_no_code(PAQ650),
+      PAQ665 = clean_yes_no_code(PAQ665),
+      
+      PAQ655 = clean_numeric_code(PAQ655),
+      PAD660 = clean_numeric_code(PAD660),
+      
+      PAQ670 = clean_numeric_code(PAQ670),
+      PAD675 = clean_numeric_code(PAD675),
+      
+      sedentary_min_raw = clean_numeric_code(PAD680),
+      
+      MET_high_raw = case_when(
+        PAQ650 == 2 ~ 0,
+        PAQ650 == 1 & !is.na(PAQ655) & !is.na(PAD660) ~
+          PAQ655 * PAD660 * 8,
+        TRUE ~ NA_real_
+      ),
+      
+      MET_mod_raw = case_when(
+        PAQ665 == 2 ~ 0,
+        PAQ665 == 1 & !is.na(PAQ670) & !is.na(PAD675) ~
+          PAQ670 * PAD675 * 4,
+        TRUE ~ NA_real_
+      ),
+      
+      MET_total_raw = case_when(
+        !is.na(MET_high_raw) & !is.na(MET_mod_raw) ~
+          MET_high_raw + MET_mod_raw,
+        !is.na(MET_high_raw) & is.na(MET_mod_raw) ~
+          MET_high_raw,
+        is.na(MET_high_raw) & !is.na(MET_mod_raw) ~
+          MET_mod_raw,
+        TRUE ~ NA_real_
+      ),
+      
+      CYCLE = "2017-2020"
+    )
+  
+  return(processed)
+}
+
+# 6. Process 2021-2023 ---------------------------------------------------------
+
+process_paq_2123 <- function(raw_data) {
+  
+  cat("Processing PAQ cycle: 2021-2023\n")
+  
+  required_vars <- c(
+    "SEQN",
+    "PAD790Q", "PAD790U", "PAD800",
+    "PAD810Q", "PAD810U", "PAD820",
+    "PAD680"
+  )
+  
+  missing_vars <- setdiff(required_vars, names(raw_data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required PAQ variables in 2021-2023: ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  cat("\nRaw PAD790U distribution, 2021-2023:\n")
+  print(table(raw_data$PAD790U, useNA = "ifany"))
+  
+  cat("\nRaw PAD810U distribution, 2021-2023:\n")
+  print(table(raw_data$PAD810U, useNA = "ifany"))
+  
+  processed <- raw_data %>%
+    as_tibble() %>%
+    select(all_of(required_vars)) %>%
+    mutate(
+      SEQN = clean_numeric_code(SEQN),
+      
+      PAD790Q_raw = PAD790Q,
+      PAD790U_raw = PAD790U,
+      PAD800_raw  = PAD800,
+      
+      PAD810Q_raw = PAD810Q,
+      PAD810U_raw = PAD810U,
+      PAD820_raw  = PAD820,
+      
+      PAD680_raw = PAD680,
+      
+      PAD790Q = clean_numeric_code(PAD790Q),
+      PAD800  = clean_numeric_code(PAD800),
+      
+      PAD810Q = clean_numeric_code(PAD810Q),
+      PAD820  = clean_numeric_code(PAD820),
+      
+      PAD790U_clean = clean_frequency_unit(PAD790U),
+      PAD810U_clean = clean_frequency_unit(PAD810U),
+      
+      u_mod = unit_to_week_multiplier(PAD790U_clean),
+      u_high = unit_to_week_multiplier(PAD810U_clean),
+      
+      MET_mod_raw = case_when(
+        !is.na(PAD790Q) & !is.na(u_mod) & !is.na(PAD800) ~
+          PAD790Q * u_mod * PAD800 * 4,
+        TRUE ~ NA_real_
+      ),
+      
+      MET_high_raw = case_when(
+        !is.na(PAD810Q) & !is.na(u_high) & !is.na(PAD820) ~
+          PAD810Q * u_high * PAD820 * 8,
+        TRUE ~ NA_real_
+      ),
+      
+      MET_total_raw = case_when(
+        !is.na(MET_high_raw) & !is.na(MET_mod_raw) ~
+          MET_high_raw + MET_mod_raw,
+        !is.na(MET_high_raw) & is.na(MET_mod_raw) ~
+          MET_high_raw,
+        is.na(MET_high_raw) & !is.na(MET_mod_raw) ~
+          MET_mod_raw,
+        TRUE ~ NA_real_
+      ),
+      
+      sedentary_min_raw = clean_numeric_code(PAD680),
+      
+      CYCLE = "2021-2023"
+    )
+  
+  return(processed)
+}
+
+# 7. Process and Merge ---------------------------------------------------------
+
+df_1720 <- process_paq_1720(p_paq)
+df_2123 <- process_paq_2123(paq_l)
+
+pa_combined <- bind_rows(df_1720, df_2123)
+
+# 8. Truncation and Categorization --------------------------------------------
+
+final_data <- pa_combined %>%
+  mutate(
+    MET_total_truncated_flag = case_when(
+      is.na(MET_total_raw) ~ NA_real_,
+      MET_total_raw > 30000 ~ 1,
+      TRUE ~ 0
+    ),
+    
+    sedentary_truncated_flag = case_when(
+      is.na(sedentary_min_raw) ~ NA_real_,
+      sedentary_min_raw > 960 ~ 1,
+      TRUE ~ 0
+    ),
+    
+    MET_total = truncate_upper(MET_total_raw, upper = 30000),
+    sedentary_min = truncate_upper(sedentary_min_raw, upper = 960),
+    
+    MET_cat_label = case_when(
+      is.na(MET_total) ~ NA_character_,
+      MET_total < 600 ~ "Low",
+      MET_total >= 600 & MET_total <= 3000 ~ "Moderate",
+      MET_total > 3000 ~ "High"
+    ),
+    
+    MET_cat_label = factor(
+      MET_cat_label,
+      levels = c("Low", "Moderate", "High")
+    ),
+    
+    MET_cat_num = as.numeric(MET_cat_label),
+    
+    sedentary_cat_label = case_when(
+      is.na(sedentary_min) ~ NA_character_,
+      sedentary_min < 360 ~ "<6h",
+      sedentary_min >= 360 & sedentary_min <= 480 ~ "6-8h",
+      sedentary_min > 480 ~ ">8h"
+    ),
+    
+    sedentary_cat_label = factor(
+      sedentary_cat_label,
+      levels = c("<6h", "6-8h", ">8h")
+    ),
+    
+    sedentary_cat_num = as.numeric(sedentary_cat_label)
+  )
+
+# 9. Quality Control -----------------------------------------------------------
+
+cat("\n--- Physical Activity / Sedentary Basic QC ---\n")
+
+basic_qc <- final_data %>%
+  summarise(
+    n_total = n(),
+    
+    missing_MET_raw = sum(is.na(MET_total_raw)),
+    missing_MET_total = sum(is.na(MET_total)),
+    
+    missing_sedentary_raw = sum(is.na(sedentary_min_raw)),
+    missing_sedentary_min = sum(is.na(sedentary_min)),
+    
+    n_MET_truncated =
+      sum(MET_total_truncated_flag == 1, na.rm = TRUE),
+    
+    n_sedentary_truncated =
+      sum(sedentary_truncated_flag == 1, na.rm = TRUE),
+    
+    min_MET_total =
+      min(MET_total, na.rm = TRUE),
+    
+    max_MET_total =
+      max(MET_total, na.rm = TRUE),
+    
+    min_sedentary_min =
+      min(sedentary_min, na.rm = TRUE),
+    
+    max_sedentary_min =
+      max(sedentary_min, na.rm = TRUE)
+  )
+
+print(basic_qc)
+
+cat("\n--- Continuous Variable Summary ---\n")
+
+continuous_summary <- final_data %>%
+  summarise(
+    MET_mean = mean(MET_total, na.rm = TRUE),
+    MET_median = median(MET_total, na.rm = TRUE),
+    MET_q1 = quantile(MET_total, 0.25, na.rm = TRUE),
+    MET_q3 = quantile(MET_total, 0.75, na.rm = TRUE),
+    
+    sedentary_mean = mean(sedentary_min, na.rm = TRUE),
+    sedentary_median = median(sedentary_min, na.rm = TRUE),
+    sedentary_q1 = quantile(sedentary_min, 0.25, na.rm = TRUE),
+    sedentary_q3 = quantile(sedentary_min, 0.75, na.rm = TRUE)
+  )
+
+print(continuous_summary)
+
+cat("\n--- MET Category Distribution ---\n")
+
+MET_category_dist <- final_data %>%
+  count(MET_cat_label, name = "n")
+
+print(MET_category_dist)
+
+cat("\n--- Sedentary Category Distribution ---\n")
+
+sedentary_category_dist <- final_data %>%
+  count(sedentary_cat_label, name = "n")
+
+print(sedentary_category_dist)
+
+cat("\n--- Cycle-specific QC ---\n")
+
+cycle_qc <- final_data %>%
+  group_by(CYCLE) %>%
+  summarise(
+    n_total = n(),
+    
+    missing_MET_total =
+      sum(is.na(MET_total)),
+    
+    missing_sedentary_min =
+      sum(is.na(sedentary_min)),
+    
+    n_MET_truncated =
+      sum(MET_total_truncated_flag == 1, na.rm = TRUE),
+    
+    n_sedentary_truncated =
+      sum(sedentary_truncated_flag == 1, na.rm = TRUE),
+    
+    median_MET =
+      median(MET_total, na.rm = TRUE),
+    
+    median_sedentary =
+      median(sedentary_min, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+print(cycle_qc)
+
+cat("\n--- Cross-tabulation: MET Category Mapping ---\n")
+
+MET_cross_tab <- final_data %>%
+  count(MET_cat_label, MET_cat_num, name = "n") %>%
+  arrange(MET_cat_label, MET_cat_num)
+
+print(MET_cross_tab)
+
+cat("\n--- Cross-tabulation: Sedentary Category Mapping ---\n")
+
+sedentary_cross_tab <- final_data %>%
+  count(sedentary_cat_label, sedentary_cat_num, name = "n") %>%
+  arrange(sedentary_cat_label, sedentary_cat_num)
+
+print(sedentary_cross_tab)
+
+# 10. Save QC Outputs ----------------------------------------------------------
+
+write_csv(
+  basic_qc,
+  file.path(qc_dir, "Step10_PA_sedentary_basic_qc.csv")
+)
+
+write_csv(
+  continuous_summary,
+  file.path(qc_dir, "Step10_PA_sedentary_continuous_summary.csv")
+)
+
+write_csv(
+  MET_category_dist,
+  file.path(qc_dir, "Step10_MET_category_distribution.csv")
+)
+
+write_csv(
+  sedentary_category_dist,
+  file.path(qc_dir, "Step10_sedentary_category_distribution.csv")
+)
+
+write_csv(
+  cycle_qc,
+  file.path(qc_dir, "Step10_PA_sedentary_cycle_qc.csv")
+)
+
+write_csv(
+  MET_cross_tab,
+  file.path(qc_dir, "Step10_MET_category_mapping_qc.csv")
+)
+
+write_csv(
+  sedentary_cross_tab,
+  file.path(qc_dir, "Step10_sedentary_category_mapping_qc.csv")
+)
+
+# 11. Export -------------------------------------------------------------------
+
+save_path <- file.path(export_dir, "10.data.rds")
+
+saveRDS(final_data, save_path)
+
+cat("\nProcessing complete. Dataset saved to:", save_path, "\n")
+cat("QC files saved to:", qc_dir, "\n")
+cat(
+  "Final Dataset dimensions:",
+  dim(final_data)[1],
+  "rows and",
+  dim(final_data)[2],
+  "variables.\n"
+)
