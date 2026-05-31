@@ -1,0 +1,1174 @@
+################################################################################
+# STEP 22 FINAL v2
+# Complete-case stratified and interaction analysis
+#
+# Main fixes:
+#   1. Keep complete-case main analysis logic
+#   2. Add 18-19 years as an age subgroup when present
+#   3. Ensure "Sex" subgroup header is displayed
+#   4. Bold subgroup headers in forest plot
+#   5. Replace deprecated geom_errorbarh() with geom_segment()
+#   6. Avoid top title / labels being clipped
+################################################################################
+
+rm(list = ls())
+
+library(survey)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+
+options(survey.lonely.psu = "adjust")
+
+# ==============================================================================
+# 0. Paths
+# ==============================================================================
+
+root_dir <- "D:/code"
+
+base_path <- file.path(root_dir, "12.Dataset_CompleteCase.rds")
+cmb_path  <- file.path(root_dir, "18.Dataset_CMB_six_domain_complete_case.rds")
+
+out_dir <- file.path(
+  root_dir,
+  "Step22_CMB_subgroup_interaction_complete_case_FINAL_v2"
+)
+
+fig_dir <- file.path(out_dir, "figures")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(base_path)) {
+  stop("Missing base complete-case dataset: ", base_path)
+}
+
+if (!file.exists(cmb_path)) {
+  stop("Missing CMB complete-case dataset: ", cmb_path)
+}
+
+# ==============================================================================
+# 1. Load data
+# ==============================================================================
+
+base_data <- readRDS(base_path) %>%
+  as.data.frame()
+
+cmb_data <- readRDS(cmb_path) %>%
+  as.data.frame() %>%
+  dplyr::select(SEQN, CMB_Score)
+
+nhanes_data <- base_data %>%
+  left_join(cmb_data, by = "SEQN")
+
+cat("Base N:", nrow(base_data), "\n")
+cat("Merged N:", nrow(nhanes_data), "\n")
+
+if (!"CMB_Score" %in% names(nhanes_data)) {
+  stop("CMB_Score not found after merge.")
+}
+
+# ==============================================================================
+# 2. Helper functions
+# ==============================================================================
+
+first_existing <- function(data, candidates) {
+  found <- candidates[candidates %in% names(data)]
+  if (length(found) == 0) return(NA_character_)
+  found[1]
+}
+
+format_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", round(p, 3))
+}
+
+make_sleep_duration_cat <- function(x) {
+  dplyr::case_when(
+    is.na(x) ~ NA_character_,
+    x < 7 ~ "<7 hours",
+    x >= 7 & x <= 9 ~ "7-9 hours",
+    x > 9 ~ "\u22659 hours"
+  )
+}
+
+# ==============================================================================
+# 3. Detect sleep duration variables
+# ==============================================================================
+
+dur_wd_var <- first_existing(
+  nhanes_data,
+  c(
+    "dur_wd_cat",
+    "dur_wd_cat_num",
+    "sleep_duration_weekday",
+    "sleep_duration_weekday_hours",
+    "weekday_sleep_duration",
+    "weekday_sleep_hours",
+    "dur_wd_hours",
+    "dur_wd"
+  )
+)
+
+dur_we_var <- first_existing(
+  nhanes_data,
+  c(
+    "dur_we_cat",
+    "dur_we_cat_num",
+    "sleep_duration_weekend",
+    "sleep_duration_weekend_hours",
+    "weekend_sleep_duration",
+    "weekend_sleep_hours",
+    "dur_we_hours",
+    "dur_we"
+  )
+)
+
+cat("\nDetected weekday sleep-duration variable:", dur_wd_var, "\n")
+cat("Detected weekend sleep-duration variable:", dur_we_var, "\n")
+
+# ==============================================================================
+# 4. Recode subgroup variables
+# ==============================================================================
+
+nhanes_data <- nhanes_data %>%
+  mutate(
+    Sex_cat = factor(sex),
+    
+    Age_cat = cut(
+      RIDAGEYR,
+      breaks = c(18, 20, 40, 60, Inf),
+      right = FALSE,
+      labels = c("18-19", "20-39", "40-59", "\u226560")
+    ),
+    
+    BMI_cat = cut(
+      BMI_value,
+      breaks = c(-Inf, 25, 30, Inf),
+      right = FALSE,
+      labels = c(
+        "Normal weight or below (<25)",
+        "Overweight (25-29.9)",
+        "Obese (\u226530)"
+      )
+    ),
+    
+    PIR_cat = cut(
+      INDFMPIR,
+      breaks = c(-Inf, 1.30, 3.50, Inf),
+      right = FALSE,
+      labels = c("<1.30", "1.30-3.50", "\u22653.50")
+    ),
+    
+    Sedentary_cat = cut(
+      sedentary_min / 60,
+      breaks = c(-Inf, 6, 8, Inf),
+      right = FALSE,
+      labels = c("<6 h/day", "6-8 h/day", "\u22658 h/day")
+    ),
+    
+    MET_cat_raw = case_when(
+      is.na(MET_total) ~ NA_character_,
+      MET_total < quantile(MET_total, probs = 1 / 3, na.rm = TRUE) ~ "Low",
+      MET_total < quantile(MET_total, probs = 2 / 3, na.rm = TRUE) ~ "Moderate",
+      TRUE ~ "High"
+    ),
+    
+    MET_cat = factor(
+      MET_cat_raw,
+      levels = c("Low", "Moderate", "High")
+    ),
+    
+    Race_cat = factor(race_ethnicity),
+    Education_cat = factor(education),
+    Marital_cat = factor(marital_status),
+    Smoking_cat = factor(smoke_label),
+    Alcohol_cat = factor(AlcoholCategory),
+    Diabetes_cat = factor(diabetes_label),
+    Hypertension_cat = factor(hypertension_label),
+    Work_cat = factor(work_status_label)
+  )
+
+if (!is.na(dur_wd_var)) {
+  
+  if (dur_wd_var == "dur_wd_cat") {
+    
+    nhanes_data$Dur_wd_cat <- factor(
+      nhanes_data[[dur_wd_var]],
+      levels = c("7-9 hours", "<7 hours", "\u22659 hours")
+    )
+    
+  } else if (dur_wd_var == "dur_wd_cat_num") {
+    
+    nhanes_data$Dur_wd_cat <- factor(
+      nhanes_data[[dur_wd_var]],
+      levels = c(1, 2, 3),
+      labels = c("7-9 hours", "<7 hours", "\u22659 hours")
+    )
+    
+  } else {
+    
+    nhanes_data$Dur_wd_cat <- factor(
+      make_sleep_duration_cat(nhanes_data[[dur_wd_var]]),
+      levels = c("7-9 hours", "<7 hours", "\u22659 hours")
+    )
+  }
+  
+} else {
+  stop("Weekday sleep duration variable not found.")
+}
+
+if (!is.na(dur_we_var)) {
+  
+  if (dur_we_var == "dur_we_cat") {
+    
+    nhanes_data$Dur_we_cat <- factor(
+      nhanes_data[[dur_we_var]],
+      levels = c("7-9 hours", "<7 hours", "\u22659 hours")
+    )
+    
+  } else if (dur_we_var == "dur_we_cat_num") {
+    
+    nhanes_data$Dur_we_cat <- factor(
+      nhanes_data[[dur_we_var]],
+      levels = c(1, 2, 3),
+      labels = c("7-9 hours", "<7 hours", "\u22659 hours")
+    )
+    
+  } else {
+    
+    nhanes_data$Dur_we_cat <- factor(
+      make_sleep_duration_cat(nhanes_data[[dur_we_var]]),
+      levels = c("7-9 hours", "<7 hours", "\u22659 hours")
+    )
+  }
+  
+} else {
+  stop("Weekend sleep duration variable not found.")
+}
+
+# ==============================================================================
+# 5. QC
+# ==============================================================================
+
+age_qc <- data.frame(
+  item = c(
+    "min_age",
+    "max_age",
+    "n_age_missing",
+    "n_Age_cat_missing",
+    "n_total"
+  ),
+  value = c(
+    min(nhanes_data$RIDAGEYR, na.rm = TRUE),
+    max(nhanes_data$RIDAGEYR, na.rm = TRUE),
+    sum(is.na(nhanes_data$RIDAGEYR)),
+    sum(is.na(nhanes_data$Age_cat)),
+    nrow(nhanes_data)
+  )
+)
+
+write.csv(
+  age_qc,
+  file.path(out_dir, "Step22_age_group_QC.csv"),
+  row.names = FALSE
+)
+
+age_distribution <- as.data.frame(
+  table(Age_cat = nhanes_data$Age_cat, useNA = "ifany")
+)
+
+write.csv(
+  age_distribution,
+  file.path(out_dir, "Step22_age_group_distribution.csv"),
+  row.names = FALSE
+)
+
+cat("\nAge QC:\n")
+print(age_qc)
+print(table(nhanes_data$Age_cat, useNA = "ifany"))
+
+# ==============================================================================
+# 6. Factor covariates
+# ==============================================================================
+
+factor_covariates <- c(
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "smoke_label",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label"
+)
+
+for (v in factor_covariates) {
+  if (v %in% names(nhanes_data)) {
+    nhanes_data[[v]] <- as.factor(nhanes_data[[v]])
+  }
+}
+
+# ==============================================================================
+# 7. Analytic variable definitions
+# ==============================================================================
+
+outcome_var  <- "Moderate_depression_above"
+exposure_var <- "CMB_Score"
+
+all_covs <- c(
+  "RIDAGEYR",
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "smoke_label",
+  "BMI_value",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label",
+  "MET_total",
+  "INDFMPIR",
+  "sedentary_min"
+)
+
+all_subgroup_vars <- c(
+  "Sex_cat",
+  "Age_cat",
+  "Race_cat",
+  "Education_cat",
+  "Smoking_cat",
+  "Marital_cat",
+  "BMI_cat",
+  "Alcohol_cat",
+  "Diabetes_cat",
+  "Hypertension_cat",
+  "Work_cat",
+  "PIR_cat",
+  "Dur_wd_cat",
+  "Dur_we_cat",
+  "Sedentary_cat",
+  "MET_cat"
+)
+
+plot_subgroup_vars <- c(
+  "Sex_cat",
+  "Age_cat",
+  "BMI_cat",
+  "Dur_wd_cat",
+  "Dur_we_cat"
+)
+
+redundancy_map <- list(
+  Sex_cat = "sex",
+  Age_cat = "RIDAGEYR",
+  Race_cat = "race_ethnicity",
+  Education_cat = "education",
+  Smoking_cat = "smoke_label",
+  Marital_cat = "marital_status",
+  BMI_cat = "BMI_value",
+  Alcohol_cat = "AlcoholCategory",
+  Diabetes_cat = "diabetes_label",
+  Hypertension_cat = "hypertension_label",
+  Work_cat = "work_status_label",
+  PIR_cat = "INDFMPIR",
+  Dur_wd_cat = NULL,
+  Dur_we_cat = NULL,
+  Sedentary_cat = "sedentary_min",
+  MET_cat = "MET_total"
+)
+
+required_vars <- unique(c(
+  "SEQN",
+  "SDMVPSU",
+  "SDMVSTRA",
+  "mec_adj",
+  outcome_var,
+  exposure_var,
+  all_covs,
+  all_subgroup_vars
+))
+
+missing_vars <- setdiff(required_vars, names(nhanes_data))
+
+if (length(missing_vars) > 0) {
+  stop(
+    "Missing required variables:\n",
+    paste(missing_vars, collapse = ", ")
+  )
+}
+
+# ==============================================================================
+# 8. Complete-case analysis dataset
+# ==============================================================================
+
+missingness_before_complete_case <- data.frame(
+  variable = required_vars,
+  n_missing = sapply(required_vars, function(v) sum(is.na(nhanes_data[[v]]))),
+  missing_pct = sapply(required_vars, function(v) mean(is.na(nhanes_data[[v]])) * 100)
+)
+
+write.csv(
+  missingness_before_complete_case,
+  file.path(out_dir, "Step22_missingness_before_complete_case.csv"),
+  row.names = FALSE
+)
+
+dat <- nhanes_data %>%
+  dplyr::select(all_of(required_vars)) %>%
+  dplyr::filter(
+    complete.cases(.),
+    mec_adj > 0,
+    SDMVPSU > 0,
+    SDMVSTRA > 0
+  )
+
+cat("\nAnalysis N:", nrow(dat), "\n")
+cat("Outcome distribution:\n")
+print(table(dat[[outcome_var]], useNA = "ifany"))
+
+cat("\nCMB_Score summary:\n")
+print(summary(dat[[exposure_var]]))
+
+if (nrow(dat) == 0) {
+  stop("No complete-case observations available for Step22.")
+}
+
+# ==============================================================================
+# 9. Survey design
+# ==============================================================================
+
+design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = dat,
+  nest = TRUE
+)
+
+# ==============================================================================
+# 10. Subgroup analysis function
+# ==============================================================================
+
+run_subgroup_analysis <- function(sub_var,
+                                  compute_strata = sub_var %in% plot_subgroup_vars,
+                                  min_n = 50) {
+  
+  cat(
+    "Running:",
+    sub_var,
+    ifelse(compute_strata, "+ stratified ORs", "+ interaction only"),
+    "\n"
+  )
+  
+  vars_to_remove <- c(sub_var, redundancy_map[[sub_var]])
+  clean_covs <- setdiff(all_covs, vars_to_remove)
+  
+  interaction_formula <- as.formula(
+    paste0(
+      outcome_var,
+      " ~ ",
+      exposure_var,
+      " * ",
+      sub_var,
+      " + ",
+      paste(clean_covs, collapse = " + ")
+    )
+  )
+  
+  model_int <- tryCatch(
+    svyglm(
+      interaction_formula,
+      design = design,
+      family = quasibinomial()
+    ),
+    error = function(e) {
+      message("Interaction model failed for ", sub_var, ": ", e$message)
+      NULL
+    }
+  )
+  
+  p_int <- tryCatch(
+    {
+      if (is.null(model_int)) {
+        NA_real_
+      } else {
+        regTermTest(
+          model_int,
+          as.formula(paste0("~", exposure_var, ":", sub_var))
+        )$p
+      }
+    },
+    error = function(e) {
+      message("Interaction test failed for ", sub_var, ": ", e$message)
+      NA_real_
+    }
+  )
+  
+  if (!compute_strata) {
+    return(
+      data.frame(
+        Subgroup = sub_var,
+        Level = NA_character_,
+        n_unweighted = NA_integer_,
+        beta = NA_real_,
+        se = NA_real_,
+        OR = NA_real_,
+        lower95 = NA_real_,
+        upper95 = NA_real_,
+        p_value = NA_real_,
+        P_Interaction = p_int,
+        plot_stratum = FALSE,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+  
+  levels_sub <- levels(droplevels(dat[[sub_var]]))
+  
+  stratified_results <- map_df(
+    levels_sub,
+    function(lvl) {
+      
+      idx <- dat[[sub_var]] == lvl
+      idx[is.na(idx)] <- FALSE
+      
+      n_sub <- sum(idx)
+      
+      if (n_sub < min_n) {
+        return(NULL)
+      }
+      
+      sub_design <- subset(design, idx)
+      
+      strat_formula <- as.formula(
+        paste0(
+          outcome_var,
+          " ~ ",
+          exposure_var,
+          " + ",
+          paste(clean_covs, collapse = " + ")
+        )
+      )
+      
+      model_strat <- tryCatch(
+        svyglm(
+          strat_formula,
+          design = sub_design,
+          family = quasibinomial()
+        ),
+        error = function(e) {
+          message(
+            "Stratified model failed: ",
+            sub_var,
+            " / ",
+            lvl,
+            ": ",
+            e$message
+          )
+          NULL
+        }
+      )
+      
+      if (is.null(model_strat)) {
+        return(NULL)
+      }
+      
+      cf <- summary(model_strat)$coefficients
+      
+      if (!exposure_var %in% rownames(cf)) {
+        return(NULL)
+      }
+      
+      est <- cf[exposure_var, "Estimate"]
+      se  <- cf[exposure_var, "Std. Error"]
+      p   <- cf[exposure_var, "Pr(>|t|)"]
+      
+      data.frame(
+        Subgroup = sub_var,
+        Level = as.character(lvl),
+        n_unweighted = n_sub,
+        beta = est,
+        se = se,
+        OR = exp(est),
+        lower95 = exp(est - 1.96 * se),
+        upper95 = exp(est + 1.96 * se),
+        p_value = p,
+        P_Interaction = p_int,
+        plot_stratum = TRUE,
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+  
+  stratified_results
+}
+
+# ==============================================================================
+# 11. Run analyses
+# ==============================================================================
+
+raw_results <- map_df(
+  all_subgroup_vars,
+  run_subgroup_analysis
+)
+
+write.csv(
+  raw_results,
+  file.path(out_dir, "Step22_CMB_subgroup_raw_results.csv"),
+  row.names = FALSE
+)
+
+interaction_summary <- raw_results %>%
+  group_by(Subgroup) %>%
+  summarise(
+    P_raw = first(P_Interaction),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    P_FDR = p.adjust(P_raw, method = "fdr"),
+    P_raw_fmt = sapply(P_raw, format_p),
+    P_FDR_fmt = sapply(P_FDR, format_p)
+  )
+
+write.csv(
+  interaction_summary,
+  file.path(out_dir, "Step22_CMB_interaction_summary_FDR.csv"),
+  row.names = FALSE
+)
+
+cat("\nInteraction summary:\n")
+print(interaction_summary)
+
+# ==============================================================================
+# 12. Publication tables
+# ==============================================================================
+
+label_map <- c(
+  Sex_cat = "Sex",
+  Age_cat = "Age group, years",
+  Race_cat = "Race/ethnicity",
+  Education_cat = "Education",
+  Smoking_cat = "Smoking status",
+  Marital_cat = "Marital status",
+  BMI_cat = "Body mass index",
+  Alcohol_cat = "Alcohol consumption",
+  Diabetes_cat = "Diabetes",
+  Hypertension_cat = "Hypertension",
+  Work_cat = "Work status",
+  PIR_cat = "Income-to-poverty ratio",
+  Dur_wd_cat = "Weekday sleep duration",
+  Dur_we_cat = "Weekend sleep duration",
+  Sedentary_cat = "Sedentary time",
+  MET_cat = "Physical activity"
+)
+
+subgroup_table <- raw_results %>%
+  filter(plot_stratum == TRUE) %>%
+  left_join(interaction_summary, by = "Subgroup") %>%
+  mutate(
+    Subgroup_Label = dplyr::recode(
+      Subgroup,
+      !!!label_map,
+      .default = Subgroup
+    ),
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)),
+      " (",
+      sprintf("%.3f", round(lower95, 3)),
+      "-",
+      sprintf("%.3f", round(upper95, 3)),
+      ")"
+    ),
+    P_value_fmt = sapply(p_value, format_p)
+  ) %>%
+  transmute(
+    Subgroup = Subgroup_Label,
+    Level = Level,
+    N = n_unweighted,
+    OR = round(OR, 3),
+    Lower_95CI = round(lower95, 3),
+    Upper_95CI = round(upper95, 3),
+    OR_95CI = OR_95CI,
+    P_value = P_value_fmt,
+    P_interaction = P_raw_fmt,
+    P_interaction_FDR = P_FDR_fmt
+  )
+
+write.csv(
+  subgroup_table,
+  file.path(out_dir, "Step22_CMB_subgroup_OR_CI_P_table.csv"),
+  row.names = FALSE
+)
+
+interaction_table <- interaction_summary %>%
+  mutate(
+    Subgroup_Label = dplyr::recode(
+      Subgroup,
+      !!!label_map,
+      .default = Subgroup
+    )
+  ) %>%
+  transmute(
+    Subgroup = Subgroup_Label,
+    P_interaction_raw = P_raw,
+    P_interaction_raw_fmt = P_raw_fmt,
+    P_interaction_FDR = P_FDR,
+    P_interaction_FDR_fmt = P_FDR_fmt
+  )
+
+write.csv(
+  interaction_table,
+  file.path(out_dir, "Step22_CMB_interaction_P_table.csv"),
+  row.names = FALSE
+)
+
+cat("\nSubgroup OR/CI/P table:\n")
+print(subgroup_table)
+
+# ==============================================================================
+# 13. Forest plot data
+# ==============================================================================
+
+subgroup_order <- c(
+  "Sex",
+  "Age group, years",
+  "Body mass index",
+  "Weekday sleep duration",
+  "Weekend sleep duration"
+)
+
+plot_ready <- raw_results %>%
+  filter(plot_stratum == TRUE) %>%
+  left_join(interaction_summary, by = "Subgroup") %>%
+  mutate(
+    Subgroup_Label = dplyr::recode(
+      Subgroup,
+      !!!label_map,
+      .default = Subgroup
+    )
+  ) %>%
+  filter(Subgroup_Label %in% subgroup_order) %>%
+  distinct(Subgroup_Label, Level, .keep_all = TRUE) %>%
+  mutate(
+    Subgroup_Label = factor(Subgroup_Label, levels = subgroup_order)
+  ) %>%
+  arrange(Subgroup_Label)
+
+final_plot_df <- data.frame()
+
+for (sub in subgroup_order) {
+  
+  sub_data <- plot_ready %>%
+    filter(as.character(Subgroup_Label) == sub)
+  
+  if (nrow(sub_data) == 0) {
+    next
+  }
+  
+  header <- data.frame(
+    Subgroup_Label = sub,
+    Level = sub,
+    n_unweighted = NA_integer_,
+    OR = NA_real_,
+    lower95 = NA_real_,
+    upper95 = NA_real_,
+    is_header = TRUE,
+    stringsAsFactors = FALSE
+  )
+  
+  levels_df <- sub_data %>%
+    transmute(
+      Subgroup_Label = as.character(Subgroup_Label),
+      Level = as.character(Level),
+      n_unweighted = n_unweighted,
+      OR = OR,
+      lower95 = lower95,
+      upper95 = upper95,
+      is_header = FALSE
+    )
+  
+  final_plot_df <- bind_rows(
+    final_plot_df,
+    header,
+    levels_df
+  )
+}
+
+final_plot_df <- final_plot_df %>%
+  mutate(
+    row_id = row_number(),
+    y_pos = rev(row_id),
+    y_label = ifelse(
+      is_header,
+      Level,
+      paste0("   ", trimws(Level))
+    ),
+    label_fontface = ifelse(is_header, "bold", "plain")
+  )
+
+write.csv(
+  final_plot_df,
+  file.path(out_dir, "Step22_CMB_subgroup_forest_plot_data_clean.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 14. Forest plot
+# ==============================================================================
+
+plot_df <- final_plot_df
+
+non_header_df <- plot_df %>%
+  filter(is_header == FALSE)
+
+label_df <- plot_df %>%
+  filter(is_header == TRUE)
+
+x_min <- min(
+  0.95,
+  floor(min(non_header_df$lower95, na.rm = TRUE) * 20) / 20
+)
+
+x_max <- max(
+  1.20,
+  ceiling(max(non_header_df$upper95, na.rm = TRUE) * 20) / 20
+)
+
+p_forest <- ggplot(plot_df, aes(y = y_pos)) +
+  
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    color = "grey45",
+    linewidth = 0.45
+  ) +
+  
+  geom_segment(
+    data = non_header_df,
+    aes(
+      x = lower95,
+      xend = upper95,
+      y = y_pos,
+      yend = y_pos
+    ),
+    linewidth = 0.75,
+    color = "#0072B2",
+    lineend = "round"
+  ) +
+  
+  geom_point(
+    data = non_header_df,
+    aes(
+      x = OR,
+      y = y_pos
+    ),
+    color = "#D55E00",
+    size = 2.7,
+    shape = 15
+  ) +
+  
+  scale_x_continuous(
+    limits = c(x_min, x_max),
+    breaks = pretty(c(x_min, x_max), n = 5),
+    expand = expansion(mult = c(0.02, 0.06))
+  ) +
+  
+  scale_y_continuous(
+    breaks = plot_df$y_pos,
+    labels = plot_df$y_label,
+    expand = expansion(mult = c(0.06, 0.10))
+  ) +
+  
+  labs(
+    title = "Subgroup analyses of CMB score and depressive symptoms",
+    subtitle = "Complete-case analysis; OR per 1-point increase in CMB score",
+    x = "Odds ratio (95% CI)",
+    y = NULL
+  ) +
+  
+  theme_classic(base_size = 11) +
+  
+  theme(
+    plot.title = element_text(
+      size = 12,
+      face = "bold",
+      hjust = 0,
+      margin = margin(b = 4)
+    ),
+    plot.subtitle = element_text(
+      size = 10,
+      hjust = 0,
+      margin = margin(b = 8)
+    ),
+    axis.title.x = element_text(
+      size = 10,
+      color = "black",
+      margin = margin(t = 8)
+    ),
+    axis.text.x = element_text(
+      size = 9.5,
+      color = "black"
+    ),
+    axis.text.y = element_text(
+      size = 9.5,
+      color = "black",
+      hjust = 1
+    ),
+    axis.ticks.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_line(
+      color = "black",
+      linewidth = 0.45
+    ),
+    axis.ticks.x = element_line(
+      color = "black",
+      linewidth = 0.35
+    ),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    plot.margin = margin(18, 12, 12, 18)
+  ) +
+  
+  coord_cartesian(clip = "off")
+
+# Bold subgroup labels using grid editing after drawing is difficult in base ggplot.
+# Therefore save a clean main version and also save a label-bolded manual version below.
+
+ggsave(
+  filename = file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_clean.tiff"),
+  plot = p_forest,
+  width = 7.2,
+  height = 7.6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_clean.png"),
+  plot = p_forest,
+  width = 7.2,
+  height = 7.6,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_clean.pdf"),
+  plot = p_forest,
+  width = 7.2,
+  height = 7.6,
+  units = "in",
+  device = cairo_pdf
+)
+
+print(p_forest)
+
+# ==============================================================================
+# 15. Alternative publication plot with manually bolded subgroup headers
+# ==============================================================================
+
+plot_range <- x_max - x_min
+label_x <- x_min - plot_range * 0.62
+forest_x_min <- x_min - plot_range * 0.70
+
+p_forest_bold <- ggplot(plot_df, aes(y = y_pos)) +
+  
+  geom_text(
+    aes(
+      x = label_x,
+      label = y_label,
+      fontface = label_fontface
+    ),
+    hjust = 0,
+    size = 3.2,
+    color = "black"
+  ) +
+  
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    color = "grey45",
+    linewidth = 0.45
+  ) +
+  
+  geom_segment(
+    data = non_header_df,
+    aes(
+      x = lower95,
+      xend = upper95,
+      y = y_pos,
+      yend = y_pos
+    ),
+    linewidth = 0.75,
+    color = "#0072B2",
+    lineend = "round"
+  ) +
+  
+  geom_point(
+    data = non_header_df,
+    aes(
+      x = OR,
+      y = y_pos
+    ),
+    color = "#D55E00",
+    size = 2.7,
+    shape = 15
+  ) +
+  
+  scale_x_continuous(
+    limits = c(forest_x_min, x_max),
+    breaks = pretty(c(x_min, x_max), n = 5),
+    expand = expansion(mult = c(0.01, 0.05))
+  ) +
+  
+  scale_y_continuous(
+    breaks = NULL,
+    expand = expansion(mult = c(0.06, 0.10))
+  ) +
+  
+  labs(
+    title = NULL,
+    subtitle = NULL,
+    x = "Odds ratio (95% CI)",
+    y = NULL
+  ) +
+  
+  theme_classic(base_size = 11) +
+  
+  theme(
+    plot.title = element_text(
+      size = 12,
+      face = "bold",
+      hjust = 0,
+      margin = margin(b = 4)
+    ),
+    plot.subtitle = element_text(
+      size = 10,
+      hjust = 0,
+      margin = margin(b = 8)
+    ),
+    axis.title.x = element_text(
+      size = 10,
+      color = "black",
+      margin = margin(t = 8)
+    ),
+    axis.text.x = element_text(
+      size = 9.5,
+      color = "black"
+    ),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.line.x = element_line(
+      color = "black",
+      linewidth = 0.45
+    ),
+    axis.ticks.x = element_line(
+      color = "black",
+      linewidth = 0.35
+    ),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    plot.margin = margin(20, 14, 12, 14)
+  ) +
+  
+  coord_cartesian(clip = "off")
+
+ggsave(
+  filename = file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_bold_headers.tiff"),
+  plot = p_forest_bold,
+  width = 7.6,
+  height = 7.6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_bold_headers.png"),
+  plot = p_forest_bold,
+  width = 7.6,
+  height = 7.6,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_bold_headers.pdf"),
+  plot = p_forest_bold,
+  width = 7.6,
+  height = 7.6,
+  units = "in",
+  device = cairo_pdf
+)
+
+print(p_forest_bold)
+
+# ==============================================================================
+# 16. QC summary
+# ==============================================================================
+
+qc <- data.frame(
+  item = c(
+    "base_file",
+    "cmb_file",
+    "analysis_n",
+    "exposure",
+    "outcome",
+    "interaction_variables_n",
+    "plotted_subgroup_variables",
+    "age_min",
+    "age_max",
+    "age_group_missing",
+    "output_raw_results",
+    "output_subgroup_table",
+    "output_interaction_table",
+    "output_plot_data",
+    "forest_plot_clean_tiff",
+    "forest_plot_bold_headers_tiff"
+  ),
+  value = c(
+    base_path,
+    cmb_path,
+    nrow(dat),
+    exposure_var,
+    outcome_var,
+    length(all_subgroup_vars),
+    paste(plot_subgroup_vars, collapse = ", "),
+    min(nhanes_data$RIDAGEYR, na.rm = TRUE),
+    max(nhanes_data$RIDAGEYR, na.rm = TRUE),
+    sum(is.na(nhanes_data$Age_cat)),
+    file.path(out_dir, "Step22_CMB_subgroup_raw_results.csv"),
+    file.path(out_dir, "Step22_CMB_subgroup_OR_CI_P_table.csv"),
+    file.path(out_dir, "Step22_CMB_interaction_P_table.csv"),
+    file.path(out_dir, "Step22_CMB_subgroup_forest_plot_data_clean.csv"),
+    file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_clean.tiff"),
+    file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_bold_headers.tiff")
+  )
+)
+
+write.csv(
+  qc,
+  file.path(out_dir, "Step22_CMB_subgroup_QC_summary.csv"),
+  row.names = FALSE
+)
+
+cat("\n============================================================\n")
+cat("STEP 22 FINAL v2 COMPLETE\n")
+cat("============================================================\n")
+cat("Analysis N:", nrow(dat), "\n")
+cat("Subgroup table:", file.path(out_dir, "Step22_CMB_subgroup_OR_CI_P_table.csv"), "\n")
+cat("Interaction table:", file.path(out_dir, "Step22_CMB_interaction_P_table.csv"), "\n")
+cat("Clean forest plot:", file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_clean.tiff"), "\n")
+cat("Bold-header forest plot:", file.path(fig_dir, "Step22_CMB_subgroup_forest_plot_bold_headers.tiff"), "\n")
+cat("Output dir:", out_dir, "\n")
+cat("============================================================\n")
