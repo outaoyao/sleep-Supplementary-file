@@ -1,0 +1,848 @@
+################################################################################
+# STEP 15 MI-ELIGIBLE
+# Sleep midpoint timing and depression
+#
+# Purpose:
+#   1. Use 12.Dataset_MI_Eligible.rds
+#   2. Do NOT delete cases due to covariate missingness
+#   3. Use exposure + outcome only
+#   4. Draw one RCS figure only
+#   5. Figure style matches main analysis:
+#        - same/similar colors
+#        - no title
+#        - no axis labels
+#        - no legend
+#   6. Output P values, nadir intervals, score distribution, and score OR
+################################################################################
+
+rm(list = ls())
+
+library(survey)
+library(rms)
+library(ggplot2)
+library(dplyr)
+library(cowplot)
+
+options(survey.lonely.psu = "adjust")
+
+# ==============================================================================
+# 0. Paths
+# ==============================================================================
+
+root_dir <- "D:/code"
+
+data_path <- file.path(root_dir, "12.Dataset_MI_Eligible.rds")
+
+if (!file.exists(data_path)) {
+  stop("Cannot find: D:/code/12.Dataset_MI_Eligible.rds")
+}
+
+out_dir <- file.path(
+  root_dir,
+  "Step15_MI_Eligible_RCS_exposure_outcome_only"
+)
+
+fig_dir <- file.path(out_dir, "figures")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ==============================================================================
+# 1. Load data
+# ==============================================================================
+
+dat0 <- readRDS(data_path)
+dat0 <- as.data.frame(dat0)
+
+cat("Loaded dataset:\n")
+cat("Rows:", nrow(dat0), "\n")
+cat("Cols:", ncol(dat0), "\n\n")
+
+# ==============================================================================
+# 2. Create exposure variables
+# ==============================================================================
+
+if ("midpoint_wd_hour" %in% names(dat0)) {
+  dat0$sleep_midpoint_weekday_hours <- dat0$midpoint_wd_hour
+} else if ("midpoint_wd" %in% names(dat0)) {
+  dat0$sleep_midpoint_weekday_hours <- dat0$midpoint_wd / 60
+} else {
+  stop("Missing weekday midpoint variable.")
+}
+
+if ("midpoint_we_hour" %in% names(dat0)) {
+  dat0$sleep_midpoint_weekend_hours <- dat0$midpoint_we_hour
+} else if ("midpoint_we" %in% names(dat0)) {
+  dat0$sleep_midpoint_weekend_hours <- dat0$midpoint_we / 60
+} else {
+  stop("Missing weekend midpoint variable.")
+}
+
+# ==============================================================================
+# 3. Required variables only
+# ==============================================================================
+
+outcome_var <- "Moderate_depression_above"
+
+required_vars <- c(
+  "SEQN",
+  "SDMVPSU",
+  "SDMVSTRA",
+  "mec_adj",
+  outcome_var,
+  "sleep_midpoint_weekday_hours",
+  "sleep_midpoint_weekend_hours"
+)
+
+missing_vars <- setdiff(required_vars, names(dat0))
+
+if (length(missing_vars) > 0) {
+  stop(
+    paste0(
+      "Missing variables: ",
+      paste(missing_vars, collapse = ", ")
+    )
+  )
+}
+
+dat <- dat0 %>%
+  dplyr::select(all_of(required_vars)) %>%
+  dplyr::filter(
+    !is.na(.data[[outcome_var]]),
+    !is.na(sleep_midpoint_weekday_hours),
+    !is.na(sleep_midpoint_weekend_hours),
+    !is.na(mec_adj),
+    !is.na(SDMVPSU),
+    !is.na(SDMVSTRA),
+    mec_adj > 0,
+    SDMVPSU > 0,
+    SDMVSTRA > 0
+  )
+
+cat("Original N:", nrow(dat0), "\n")
+cat("Analysis N:", nrow(dat), "\n")
+cat("Removed N :", nrow(dat0) - nrow(dat), "\n\n")
+
+cat("Outcome distribution:\n")
+print(table(dat[[outcome_var]], useNA = "ifany"))
+
+cat("\nExposure range:\n")
+cat(
+  "Weekday:",
+  round(min(dat$sleep_midpoint_weekday_hours, na.rm = TRUE), 2),
+  "-",
+  round(max(dat$sleep_midpoint_weekday_hours, na.rm = TRUE), 2),
+  "\n"
+)
+
+cat(
+  "Weekend:",
+  round(min(dat$sleep_midpoint_weekend_hours, na.rm = TRUE), 2),
+  "-",
+  round(max(dat$sleep_midpoint_weekend_hours, na.rm = TRUE), 2),
+  "\n\n"
+)
+
+# ==============================================================================
+# 4. Survey design
+# ==============================================================================
+
+dd <- datadist(dat)
+options(datadist = "dd")
+
+design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = dat,
+  nest = TRUE
+)
+
+# ==============================================================================
+# 5. Fit RCS models
+# ==============================================================================
+
+fit_weekday <- svyglm(
+  Moderate_depression_above ~ rcs(sleep_midpoint_weekday_hours, 4),
+  design = design,
+  family = quasibinomial()
+)
+
+fit_weekend <- svyglm(
+  Moderate_depression_above ~ rcs(sleep_midpoint_weekend_hours, 4),
+  design = design,
+  family = quasibinomial()
+)
+
+# ==============================================================================
+# 6. Prediction function
+# ==============================================================================
+
+make_newdata <- function(exposure) {
+  
+  newdat <- data.frame(x = seq(0, 24, length.out = 200))
+  names(newdat)[1] <- exposure
+  
+  newdat
+}
+
+predict_rcs <- function(model, exposure, timing) {
+  
+  newdat <- make_newdata(exposure)
+  
+  X <- model.matrix(
+    delete.response(terms(model)),
+    data = newdat
+  )
+  
+  beta <- coef(model)
+  V <- vcov(model)
+  
+  common <- intersect(colnames(X), names(beta))
+  
+  X <- X[, common, drop = FALSE]
+  beta <- beta[common]
+  V <- V[common, common, drop = FALSE]
+  
+  fit <- as.numeric(X %*% beta)
+  se <- sqrt(pmax(0, rowSums((X %*% V) * X)))
+  
+  ref_fit <- min(fit, na.rm = TRUE)
+  
+  data.frame(
+    hours = newdat[[exposure]],
+    yhat = exp(fit - ref_fit),
+    lower = exp((fit - 1.96 * se) - ref_fit),
+    upper = exp((fit + 1.96 * se) - ref_fit),
+    timing = timing
+  )
+}
+
+plot_weekday <- predict_rcs(
+  model = fit_weekday,
+  exposure = "sleep_midpoint_weekday_hours",
+  timing = "Weekday"
+)
+
+plot_weekend <- predict_rcs(
+  model = fit_weekend,
+  exposure = "sleep_midpoint_weekend_hours",
+  timing = "Weekend"
+)
+
+plot_data <- rbind(
+  plot_weekday,
+  plot_weekend
+)
+
+write.csv(
+  plot_data,
+  file.path(out_dir, "Step15_MI_Eligible_RCS_plot_data.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 7. Overall and nonlinear P values
+# ==============================================================================
+
+wald_test <- function(model, exposure, nonlinear_only = FALSE) {
+  
+  beta <- coef(model)
+  V <- vcov(model)
+  
+  idx <- grep(
+    exposure,
+    names(beta),
+    fixed = TRUE
+  )
+  
+  if (nonlinear_only) {
+    idx <- idx[-1]
+  }
+  
+  if (length(idx) == 0) {
+    return(NA_real_)
+  }
+  
+  b <- beta[idx]
+  VV <- V[idx, idx, drop = FALSE]
+  
+  stat <- as.numeric(
+    t(b) %*% solve(VV) %*% b
+  )
+  
+  df <- length(b)
+  
+  pchisq(
+    stat,
+    df = df,
+    lower.tail = FALSE
+  )
+}
+
+format_p <- function(p) {
+  
+  if (is.na(p)) {
+    return(NA_character_)
+  }
+  
+  if (p < 0.001) {
+    return("<0.001")
+  }
+  
+  sprintf("%.3f", round(p, 3))
+}
+
+p_table <- data.frame(
+  Timing = c("Weekday", "Weekend"),
+  Overall_P = c(
+    wald_test(
+      fit_weekday,
+      "sleep_midpoint_weekday_hours",
+      nonlinear_only = FALSE
+    ),
+    wald_test(
+      fit_weekend,
+      "sleep_midpoint_weekend_hours",
+      nonlinear_only = FALSE
+    )
+  ),
+  Nonlinear_P = c(
+    wald_test(
+      fit_weekday,
+      "sleep_midpoint_weekday_hours",
+      nonlinear_only = TRUE
+    ),
+    wald_test(
+      fit_weekend,
+      "sleep_midpoint_weekend_hours",
+      nonlinear_only = TRUE
+    )
+  )
+) %>%
+  mutate(
+    Overall_P_fmt = sapply(Overall_P, format_p),
+    Nonlinear_P_fmt = sapply(Nonlinear_P, format_p)
+  )
+
+cat("\nRCS P values:\n")
+print(p_table)
+
+write.csv(
+  p_table,
+  file.path(out_dir, "Step15_MI_Eligible_RCS_P_values.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 8. Nadir and score intervals
+# ==============================================================================
+
+VAL_REF <- 1.05
+VAL_MILD <- 1.20
+VAL_MODERATE <- 1.50
+
+summarise_nadir <- function(rcs_data, label) {
+  
+  idx <- which.min(rcs_data$yhat)
+  nadir_or <- rcs_data$yhat[idx]
+  
+  ref_data <- rcs_data[
+    rcs_data$yhat <= VAL_REF * nadir_or,
+  ]
+  
+  data.frame(
+    Timing = label,
+    Nadir_hour = rcs_data$hours[idx],
+    Nadir_OR = nadir_or,
+    Reference_start_hour = min(ref_data$hours, na.rm = TRUE),
+    Reference_end_hour = max(ref_data$hours, na.rm = TRUE)
+  )
+}
+
+nadir_table <- rbind(
+  summarise_nadir(plot_weekday, "Weekday"),
+  summarise_nadir(plot_weekend, "Weekend")
+)
+
+cat("\nNadir table:\n")
+print(nadir_table)
+
+write.csv(
+  nadir_table,
+  file.path(out_dir, "Step15_MI_Eligible_nadir_table.csv"),
+  row.names = FALSE
+)
+
+map_or_to_score <- function(hours_val, rcs_plot_data) {
+  
+  if (is.na(hours_val)) {
+    return(NA_integer_)
+  }
+  
+  idx <- which.min(
+    abs(rcs_plot_data$hours - hours_val)
+  )
+  
+  predicted_or <- rcs_plot_data$yhat[idx]
+  nadir_or <- min(rcs_plot_data$yhat, na.rm = TRUE)
+  
+  dplyr::case_when(
+    predicted_or <= VAL_REF * nadir_or ~ 0L,
+    predicted_or <= VAL_MILD * nadir_or ~ 1L,
+    predicted_or <= VAL_MODERATE * nadir_or ~ 2L,
+    TRUE ~ 3L
+  )
+}
+
+summarize_score_intervals <- function(rcs_data, label) {
+  
+  tmp <- rcs_data
+  
+  tmp$score <- sapply(
+    tmp$hours,
+    map_or_to_score,
+    rcs_plot_data = tmp
+  )
+  
+  gradient_labels <- c(
+    "0" = "Reference",
+    "1" = "Mild",
+    "2" = "Moderate",
+    "3" = "High"
+  )
+  
+  tmp %>%
+    group_by(score) %>%
+    summarise(
+      Start_Hour = min(hours),
+      End_Hour = max(hours),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Gradient = gradient_labels[as.character(score)],
+      Timing = label
+    )
+}
+
+score_interval_weekday <- summarize_score_intervals(
+  plot_weekday,
+  "Weekday"
+)
+
+score_interval_weekend <- summarize_score_intervals(
+  plot_weekend,
+  "Weekend"
+)
+
+score_intervals <- rbind(
+  score_interval_weekday,
+  score_interval_weekend
+)
+
+cat("\nScore intervals:\n")
+print(score_intervals)
+
+write.csv(
+  score_intervals,
+  file.path(out_dir, "Step15_MI_Eligible_score_intervals.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 9. Individual-level score assignment
+# ==============================================================================
+
+dat_scored <- dat %>%
+  mutate(
+    weekday_midpoint_score = sapply(
+      sleep_midpoint_weekday_hours,
+      map_or_to_score,
+      rcs_plot_data = plot_weekday
+    ),
+    weekend_midpoint_score = sapply(
+      sleep_midpoint_weekend_hours,
+      map_or_to_score,
+      rcs_plot_data = plot_weekend
+    ),
+    sleep_midpoint_total_score =
+      weekday_midpoint_score + weekend_midpoint_score
+  )
+
+cat("\nWeekday midpoint score distribution:\n")
+print(table(dat_scored$weekday_midpoint_score, useNA = "ifany"))
+
+cat("\nWeekend midpoint score distribution:\n")
+print(table(dat_scored$weekend_midpoint_score, useNA = "ifany"))
+
+cat("\nTotal midpoint score distribution:\n")
+print(table(dat_scored$sleep_midpoint_total_score, useNA = "ifany"))
+
+score_dist <- as.data.frame(
+  table(
+    Weekday = dat_scored$weekday_midpoint_score,
+    Weekend = dat_scored$weekend_midpoint_score,
+    Total = dat_scored$sleep_midpoint_total_score,
+    useNA = "ifany"
+  )
+)
+
+write.csv(
+  score_dist,
+  file.path(out_dir, "Step15_MI_Eligible_score_distribution.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  dat_scored,
+  file.path(
+    root_dir,
+    "15.MI_Eligible_midpoint_scored_exposure_outcome_only.rds"
+  )
+)
+
+# ==============================================================================
+# 10. Association between midpoint total score and depression
+# ==============================================================================
+
+design_score <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = dat_scored,
+  nest = TRUE
+)
+
+score_model <- svyglm(
+  Moderate_depression_above ~ sleep_midpoint_total_score,
+  design = design_score,
+  family = quasibinomial()
+)
+
+score_coef <- summary(score_model)$coefficients
+
+score_result <- data.frame(
+  term = "sleep_midpoint_total_score",
+  beta = score_coef[
+    "sleep_midpoint_total_score",
+    "Estimate"
+  ],
+  se = score_coef[
+    "sleep_midpoint_total_score",
+    "Std. Error"
+  ],
+  OR = exp(
+    score_coef[
+      "sleep_midpoint_total_score",
+      "Estimate"
+    ]
+  ),
+  lower95 = exp(
+    score_coef[
+      "sleep_midpoint_total_score",
+      "Estimate"
+    ] -
+      1.96 *
+      score_coef[
+        "sleep_midpoint_total_score",
+        "Std. Error"
+      ]
+  ),
+  upper95 = exp(
+    score_coef[
+      "sleep_midpoint_total_score",
+      "Estimate"
+    ] +
+      1.96 *
+      score_coef[
+        "sleep_midpoint_total_score",
+        "Std. Error"
+      ]
+  ),
+  p_value = score_coef[
+    "sleep_midpoint_total_score",
+    "Pr(>|t|)"
+  ],
+  p_value_fmt = format_p(
+    score_coef[
+      "sleep_midpoint_total_score",
+      "Pr(>|t|)"
+    ]
+  )
+)
+
+cat("\nScore association:\n")
+print(score_result)
+
+write.csv(
+  score_result,
+  file.path(
+    out_dir,
+    "Step15_MI_Eligible_midpoint_total_score_OR.csv"
+  ),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 11. Final P value table
+# ==============================================================================
+
+final_p_table <- data.frame(
+  Analysis = c(
+    "Weekday RCS",
+    "Weekend RCS",
+    "Midpoint total score"
+  ),
+  Overall_P = c(
+    p_table$Overall_P_fmt[
+      p_table$Timing == "Weekday"
+    ],
+    p_table$Overall_P_fmt[
+      p_table$Timing == "Weekend"
+    ],
+    score_result$p_value_fmt
+  ),
+  Nonlinear_P = c(
+    p_table$Nonlinear_P_fmt[
+      p_table$Timing == "Weekday"
+    ],
+    p_table$Nonlinear_P_fmt[
+      p_table$Timing == "Weekend"
+    ],
+    "-"
+  )
+)
+
+cat("\nFinal P value table:\n")
+print(final_p_table)
+
+write.csv(
+  final_p_table,
+  file.path(
+    out_dir,
+    "Step15_MI_Eligible_Final_Pvalue_Table.csv"
+  ),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 12. Figure — same bare style as main analysis
+# ==============================================================================
+
+color_scheme <- c(
+  "Weekday" = "#009E73",
+  "Weekend" = "#D55E00"
+)
+
+journal_theme_bare <- function(base_size = 10) {
+  
+  theme_bw(base_size = base_size, base_family = "Arial") +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(
+        colour = "black",
+        linewidth = 0.6,
+        fill = NA
+      ),
+      axis.title = element_blank(),
+      axis.text = element_text(
+        colour = "black",
+        size = base_size * 0.9
+      ),
+      axis.ticks = element_line(
+        colour = "black",
+        linewidth = 0.35
+      ),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none",
+      plot.title = element_blank(),
+      plot.margin = margin(6, 8, 4, 6)
+    )
+}
+
+p <- ggplot(
+  plot_data,
+  aes(
+    x = hours,
+    y = yhat,
+    group = timing
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = lower,
+      ymax = upper,
+      fill = timing
+    ),
+    alpha = 0.18,
+    colour = NA
+  ) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    colour = "grey40",
+    linewidth = 0.45
+  ) +
+  geom_line(
+    aes(colour = timing),
+    linewidth = 0.85
+  ) +
+  scale_colour_manual(values = color_scheme) +
+  scale_fill_manual(values = color_scheme) +
+  scale_x_continuous(
+    breaks = seq(0, 24, by = 4),
+    limits = c(0, 24),
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  journal_theme_bare()
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "Step15_MI_Eligible_RCS_bare.png"
+  ),
+  plot = p,
+  width = 3.5,
+  height = 3.2,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "Step15_MI_Eligible_RCS_bare.tiff"
+  ),
+  plot = p,
+  width = 3.5,
+  height = 3.2,
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+# ==============================================================================
+# 13. QC summary
+# ==============================================================================
+
+qc <- data.frame(
+  item = c(
+    "input_file",
+    "original_n",
+    "analysis_n",
+    "removed_n",
+    "analysis_type",
+    "model_type",
+    "covariates",
+    "weight",
+    "psu",
+    "strata",
+    "weekday_overall_p",
+    "weekday_nonlinear_p",
+    "weekend_overall_p",
+    "weekend_nonlinear_p",
+    "score_OR",
+    "score_95CI",
+    "score_p",
+    "weekday_reference_interval",
+    "weekend_reference_interval",
+    "scored_rds",
+    "figure_png",
+    "figure_tiff"
+  ),
+  value = c(
+    data_path,
+    nrow(dat0),
+    nrow(dat),
+    nrow(dat0) - nrow(dat),
+    "MI-eligible dataset",
+    "survey-weighted RCS, exposure + outcome only",
+    "none",
+    "mec_adj",
+    "SDMVPSU",
+    "SDMVSTRA",
+    p_table$Overall_P_fmt[
+      p_table$Timing == "Weekday"
+    ],
+    p_table$Nonlinear_P_fmt[
+      p_table$Timing == "Weekday"
+    ],
+    p_table$Overall_P_fmt[
+      p_table$Timing == "Weekend"
+    ],
+    p_table$Nonlinear_P_fmt[
+      p_table$Timing == "Weekend"
+    ],
+    round(score_result$OR, 3),
+    paste0(
+      round(score_result$lower95, 3),
+      "-",
+      round(score_result$upper95, 3)
+    ),
+    score_result$p_value_fmt,
+    paste0(
+      round(
+        nadir_table$Reference_start_hour[
+          nadir_table$Timing == "Weekday"
+        ],
+        2
+      ),
+      "-",
+      round(
+        nadir_table$Reference_end_hour[
+          nadir_table$Timing == "Weekday"
+        ],
+        2
+      ),
+      " h"
+    ),
+    paste0(
+      round(
+        nadir_table$Reference_start_hour[
+          nadir_table$Timing == "Weekend"
+        ],
+        2
+      ),
+      "-",
+      round(
+        nadir_table$Reference_end_hour[
+          nadir_table$Timing == "Weekend"
+        ],
+        2
+      ),
+      " h"
+    ),
+    file.path(
+      root_dir,
+      "15.MI_Eligible_midpoint_scored_exposure_outcome_only.rds"
+    ),
+    file.path(
+      fig_dir,
+      "Step15_MI_Eligible_RCS_bare.png"
+    ),
+    file.path(
+      fig_dir,
+      "Step15_MI_Eligible_RCS_bare.tiff"
+    )
+  )
+)
+
+write.csv(
+  qc,
+  file.path(out_dir, "Step15_MI_Eligible_QC_summary.csv"),
+  row.names = FALSE
+)
+
+cat("\n============================================================\n")
+cat("STEP 15 MI-ELIGIBLE COMPLETE\n")
+cat("============================================================\n")
+cat("Original N:", nrow(dat0), "\n")
+cat("Analysis N:", nrow(dat), "\n")
+cat("Removed N :", nrow(dat0) - nrow(dat), "\n")
+cat("Output dir:", out_dir, "\n")
+cat("Figure dir:", fig_dir, "\n")
+cat("============================================================\n")
