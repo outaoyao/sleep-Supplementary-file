@@ -1,0 +1,772 @@
+################################################################################
+# STEP 24-MI v5 FINAL
+# Exploratory hematological biomarker analysis
+#
+# Final decision:
+#   1. Keep biomarker-to-depression forest plot only
+#   2. Do NOT generate attenuation figure
+#   3. Keep attenuation estimates only in table
+#   4. No legend, no x-axis title, no extra annotation inside forest plot
+################################################################################
+
+rm(list = ls())
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(survey)
+library(ggplot2)
+library(readr)
+library(tibble)
+library(naniar)
+
+options(survey.lonely.psu = "adjust")
+
+root_dir <- "D:/code"
+
+out_dir <- file.path(root_dir, "Step24_MI_Hematology_Mechanism_v5_FINAL")
+fig_dir <- file.path(out_dir, "figures")
+tab_dir <- file.path(out_dir, "tables")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_dir, recursive = TRUE, showWarnings = FALSE)
+
+mi_file   <- file.path(root_dir, "14.MI_completed_data_list.rds")
+cmb_file  <- file.path(root_dir, "18.MI_Eligible_CMB_scored_by_main_rules.rds")
+heme_file <- file.path(root_dir, "Mechanism_Hematology.rds")
+
+stopifnot(file.exists(mi_file))
+stopifnot(file.exists(cmb_file))
+stopifnot(file.exists(heme_file))
+
+clean_range_vec <- function(x, lower, upper) {
+  x <- suppressWarnings(as.numeric(x))
+  x[is.infinite(x)] <- NA_real_
+  x[x < lower | x > upper] <- NA_real_
+  x
+}
+
+skewness_fun <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 10) return(NA_real_)
+  s <- sd(x)
+  if (is.na(s) || s == 0) return(NA_real_)
+  mean((x - mean(x))^3) / s^3
+}
+
+pool_rubin <- function(est, se) {
+  ok <- !is.na(est) & !is.na(se)
+  est <- est[ok]
+  se  <- se[ok]
+  m <- length(est)
+  
+  if (m == 0) {
+    return(tibble(
+      m = 0L,
+      estimate = NA_real_,
+      se = NA_real_,
+      lower = NA_real_,
+      upper = NA_real_,
+      p = NA_real_
+    ))
+  }
+  
+  qbar <- mean(est)
+  ubar <- mean(se^2)
+  b <- if (m > 1) var(est) else 0
+  total_var <- ubar + (1 + 1 / m) * b
+  total_se <- sqrt(total_var)
+  z <- qbar / total_se
+  
+  tibble(
+    m = m,
+    estimate = qbar,
+    se = total_se,
+    lower = qbar - 1.96 * total_se,
+    upper = qbar + 1.96 * total_se,
+    p = 2 * pnorm(abs(z), lower.tail = FALSE)
+  )
+}
+
+format_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", round(p, 3))
+}
+
+fmt_ci <- function(or, lo, hi) {
+  if (any(is.na(c(or, lo, hi)))) return(NA_character_)
+  paste0(sprintf("%.3f", or), " (", sprintf("%.3f", lo), "-", sprintf("%.3f", hi), ")")
+}
+
+delta_atten_pooled <- function(b0, b1, se_b0, se_b1) {
+  if (any(is.na(c(b0, b1, se_b0, se_b1)))) return(NA_real_)
+  if (b0 == 0) return(NA_real_)
+  sqrt((100 * b1 / b0^2)^2 * se_b0^2 + (100 / b0)^2 * se_b1^2)
+}
+
+mi_list <- readRDS(mi_file)
+cmb_score_data <- readRDS(cmb_file)
+heme_data <- readRDS(heme_file)
+
+if (!is.list(mi_list)) stop("MI file is not a list.")
+
+cmb_score_keep <- cmb_score_data %>%
+  mutate(SEQN = as.numeric(SEQN)) %>%
+  select(
+    SEQN,
+    CMB_Score = CMB_Score_MI_main_rules,
+    weekday_midpoint_score,
+    weekend_midpoint_score,
+    weekday_onset_score,
+    weekend_onset_score,
+    weekday_wake_score,
+    weekend_wake_score
+  ) %>%
+  distinct(SEQN, .keep_all = TRUE)
+
+heme_data <- heme_data %>%
+  mutate(SEQN = as.numeric(SEQN)) %>%
+  distinct(SEQN, .keep_all = TRUE)
+
+covars <- c(
+  "RIDAGEYR",
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "smoke_status",
+  "BMI_value",
+  "Alcohol_Status",
+  "diabetes_or_prediabetes",
+  "htn_status",
+  "work_status",
+  "MET_total",
+  "INDFMPIR",
+  "sedentary_min"
+)
+
+factor_covars <- c(
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "smoke_status",
+  "Alcohol_Status",
+  "diabetes_or_prediabetes",
+  "htn_status",
+  "work_status"
+)
+
+harmonise_one_imp <- function(df, imp_id) {
+  
+  df <- df %>%
+    mutate(
+      SEQN = as.numeric(SEQN),
+      Depression = as.numeric(as.character(Moderate_depression_above)),
+      .imp = imp_id
+    )
+  
+  for (v in intersect(factor_covars, names(df))) {
+    df[[v]] <- as.factor(df[[v]])
+  }
+  
+  dat <- df %>%
+    left_join(cmb_score_keep, by = "SEQN") %>%
+    left_join(
+      heme_data %>%
+        select(-any_of(c("SDMVPSU", "SDMVSTRA", "RIDAGEYR", "RIAGENDR", "RIDRETH3"))),
+      by = "SEQN"
+    )
+  
+  if (nrow(dat) != nrow(df)) {
+    stop("Row count changed after merge in imputation ", imp_id)
+  }
+  
+  dat
+}
+
+analysis_list <- map2(mi_list, seq_along(mi_list), harmonise_one_imp)
+
+merge_qc <- tibble(
+  imp = seq_along(analysis_list),
+  n = map_int(analysis_list, nrow),
+  n_CMB_nonmiss = map_int(analysis_list, ~sum(!is.na(.x$CMB_Score))),
+  n_Depression_nonmiss = map_int(analysis_list, ~sum(!is.na(.x$Depression))),
+  n_heme_overlap = map_int(analysis_list, ~sum(.x$SEQN %in% heme_data$SEQN))
+)
+
+write.csv(
+  merge_qc,
+  file.path(out_dir, "Step24_v5_QC_01_merge_summary.csv"),
+  row.names = FALSE
+)
+
+biomarker_registry_raw <- tibble::tribble(
+  ~biomarker,       ~label,                                          ~panel,    ~weight_var,   ~lower, ~upper, ~log_candidate,
+  "LBXWBCSI",       "White blood cell count",                       "CBC",     "wt_cbc",      1,      100,    TRUE,
+  "LBDLYMNO",       "Lymphocyte count",                             "CBC",     "wt_cbc",      0.1,    20,     TRUE,
+  "LBDMONO",        "Monocyte count",                               "CBC",     "wt_cbc",      0.01,   10,     TRUE,
+  "LBDNENO",        "Neutrophil count",                             "CBC",     "wt_cbc",      0.1,    50,     TRUE,
+  "LBDEONO",        "Eosinophil count",                             "CBC",     "wt_cbc",      0,      10,     TRUE,
+  "LBDBANO",        "Basophil count",                               "CBC",     "wt_cbc",      0,      5,      TRUE,
+  "LBXRBCSI",       "Red blood cell count",                         "CBC",     "wt_cbc",      2,      8.5,    FALSE,
+  "LBXHGB",         "Hemoglobin",                                   "CBC",     "wt_cbc",      5,      22,     FALSE,
+  "LBXHCT",         "Hematocrit",                                   "CBC",     "wt_cbc",      15,     65,     FALSE,
+  "LBXMCVSI",       "Mean corpuscular volume",                      "CBC",     "wt_cbc",      50,     130,    FALSE,
+  "LBXRDW",         "Red cell distribution width (RDW)",            "CBC",     "wt_cbc",      10,     30,     TRUE,
+  "LBXPLTSI",       "Platelet count",                               "CBC",     "wt_cbc",      20,     1000,   TRUE,
+  "LBXMPSI",        "Mean platelet volume (MPV)",                   "CBC",     "wt_cbc",      3,      20,     FALSE,
+  "NLR",            "Neutrophil-to-lymphocyte ratio (NLR)",         "CBC",     "wt_cbc",      0.1,    50,     TRUE,
+  "PLR",            "Platelet-to-lymphocyte ratio (PLR)",           "CBC",     "wt_cbc",      1,      2000,   TRUE,
+  "LBXHSCRP",       "High-sensitivity C-reactive protein (hs-CRP)", "hsCRP",   "wt_crp",      0.01,   300,    TRUE,
+  "LBXSATSI",       "Alanine aminotransferase (ALT)",               "BIOPRO",  "wt_biopro",   1,      500,    TRUE,
+  "LBXSASSI",       "Aspartate aminotransferase (AST)",             "BIOPRO",  "wt_biopro",   1,      500,    TRUE,
+  "AST_ALT_ratio",  "AST-to-ALT ratio",                             "BIOPRO",  "wt_biopro",   0.1,    20,     TRUE,
+  "LBXSAPSI",       "Alkaline phosphatase (ALP)",                   "BIOPRO",  "wt_biopro",   5,      1000,   TRUE,
+  "LBXSGTSI",       "Gamma-glutamyl transferase (GGT)",             "BIOPRO",  "wt_biopro",   1,      2000,   TRUE,
+  "LBXSTB",         "Total bilirubin",                              "BIOPRO",  "wt_biopro",   0.01,   20,     TRUE,
+  "LBXSAL",         "Albumin",                                      "BIOPRO",  "wt_biopro",   1,      7,      FALSE,
+  "LBXSGB",         "Globulin",                                     "BIOPRO",  "wt_biopro",   1,      8,      FALSE,
+  "LBXSTP",         "Total protein",                                "BIOPRO",  "wt_biopro",   3,      12,     FALSE,
+  "LBXSLDSI",       "Lactate dehydrogenase (LDH)",                  "BIOPRO",  "wt_biopro",   10,     3000,   TRUE,
+  "LBXSCR",         "Creatinine",                                   "BIOPRO",  "wt_biopro",   0.1,    20,     TRUE,
+  "LBXSBU",         "Blood urea nitrogen",                          "BIOPRO",  "wt_biopro",   1,      200,    TRUE,
+  "LBXSUA",         "Uric acid",                                    "BIOPRO",  "wt_biopro",   0.5,    20,     FALSE,
+  "LBXSGL",         "Glucose",                                      "BIOPRO",  "wt_biopro",   20,     800,    TRUE,
+  "LBXSIR",         "Iron",                                         "BIOPRO",  "wt_biopro",   5,      500,    FALSE,
+  "LBXSCK",         "Creatine phosphokinase (CPK)",                 "BIOPRO",  "wt_biopro",   1,      10000,  TRUE,
+  "LBXTC",          "Total cholesterol",                            "TCHOL",   "wt_tchol",    50,     500,    FALSE,
+  "LBDHDD",         "High-density lipoprotein cholesterol (HDL-C)", "HDL",     "wt_hdl",      5,      200,    FALSE,
+  "TG_mgdL",        "Triglycerides",                                "Fasting", "wt_fasting",  10,     3000,   TRUE,
+  "LBDLDL",         "Low-density lipoprotein cholesterol (LDL-C)",  "Fasting", "wt_fasting",  1,      500,    FALSE,
+  "non_HDL_chol",   "Non-HDL cholesterol",                          "Lipid",   "wt_tchol",    1,      500,    FALSE,
+  "TC_HDL_ratio",   "Total cholesterol-to-HDL cholesterol ratio",   "Lipid",   "wt_tchol",    0.5,    30,     TRUE
+)
+
+available_registry <- biomarker_registry_raw %>%
+  filter(
+    biomarker %in% names(analysis_list[[1]]),
+    weight_var %in% names(analysis_list[[1]])
+  )
+
+log_decision <- available_registry %>%
+  rowwise() %>%
+  mutate(
+    skewness_observed = {
+      x <- clean_range_vec(analysis_list[[1]][[biomarker]], lower, upper)
+      skewness_fun(x)
+    },
+    do_log = isTRUE(log_candidate) &&
+      !is.na(skewness_observed) &&
+      abs(skewness_observed) > 1
+  ) %>%
+  ungroup()
+
+write.csv(
+  log_decision,
+  file.path(out_dir, "Step24_v5_QC_02_fixed_log_transform_decisions.csv"),
+  row.names = FALSE
+)
+
+prepare_biomarkers_one <- function(data, registry) {
+  
+  for (i in seq_len(nrow(registry))) {
+    
+    b <- registry$biomarker[i]
+    z <- paste0(b, "_z")
+    
+    x <- clean_range_vec(data[[b]], registry$lower[i], registry$upper[i])
+    
+    if (isTRUE(registry$do_log[i])) {
+      x <- log1p(x)
+    }
+    
+    data[[z]] <- as.numeric(scale(x))
+  }
+  
+  data
+}
+
+analysis_list <- map(
+  analysis_list,
+  prepare_biomarkers_one,
+  registry = log_decision
+)
+
+mcar_result <- tryCatch(
+  naniar::mcar_test(
+    analysis_list[[1]] %>%
+      select(any_of(log_decision$biomarker))
+  ),
+  error = function(e) {
+    tibble(
+      statistic = NA_real_,
+      df = NA_real_,
+      p.value = NA_real_,
+      missing.patterns = NA_real_,
+      note = conditionMessage(e)
+    )
+  }
+)
+
+write.csv(
+  mcar_result,
+  file.path(out_dir, "Step24_v5_QC_03_Little_MCAR_test.csv"),
+  row.names = FALSE
+)
+
+fit_cmb_to_biomarker_one <- function(data, biomarker_z, weight_var, covars) {
+  
+  needed <- c(biomarker_z, "CMB_Score", weight_var, "SDMVPSU", "SDMVSTRA", covars)
+  
+  model_data <- data %>%
+    filter(if_all(all_of(needed), ~!is.na(.x))) %>%
+    filter(.data[[weight_var]] > 0)
+  
+  if (nrow(model_data) < 100) return(NULL)
+  
+  des <- svydesign(
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = as.formula(paste0("~", weight_var)),
+    nest = TRUE,
+    data = model_data
+  )
+  
+  fit <- tryCatch(
+    svyglm(
+      as.formula(
+        paste(
+          biomarker_z,
+          "~",
+          paste(c("CMB_Score", covars), collapse = " + ")
+        )
+      ),
+      design = des
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(fit)) return(NULL)
+  
+  cf <- summary(fit)$coefficients
+  
+  if (!"CMB_Score" %in% rownames(cf)) return(NULL)
+  
+  tibble(
+    n = nrow(model_data),
+    beta = cf["CMB_Score", "Estimate"],
+    se = cf["CMB_Score", "Std. Error"]
+  )
+}
+
+fit_biomarker_to_dep_one <- function(data, biomarker_z, weight_var, covars) {
+  
+  needed <- c("Depression", biomarker_z, "CMB_Score", weight_var, "SDMVPSU", "SDMVSTRA", covars)
+  
+  model_data <- data %>%
+    filter(if_all(all_of(needed), ~!is.na(.x))) %>%
+    filter(.data[[weight_var]] > 0)
+  
+  if (nrow(model_data) < 100) return(NULL)
+  if (length(unique(model_data$Depression)) < 2) return(NULL)
+  
+  des <- svydesign(
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = as.formula(paste0("~", weight_var)),
+    nest = TRUE,
+    data = model_data
+  )
+  
+  fit <- tryCatch(
+    svyglm(
+      as.formula(
+        paste(
+          "Depression ~",
+          paste(c(biomarker_z, "CMB_Score", covars), collapse = " + ")
+        )
+      ),
+      design = des,
+      family = quasibinomial()
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(fit)) return(NULL)
+  
+  cf <- summary(fit)$coefficients
+  
+  if (!biomarker_z %in% rownames(cf)) return(NULL)
+  
+  tibble(
+    n = nrow(model_data),
+    beta = cf[biomarker_z, "Estimate"],
+    se = cf[biomarker_z, "Std. Error"]
+  )
+}
+
+fit_attenuation_components_one <- function(data, biomarker_z, weight_var, covars) {
+  
+  needed <- c("Depression", "CMB_Score", biomarker_z, weight_var, "SDMVPSU", "SDMVSTRA", covars)
+  
+  model_data <- data %>%
+    filter(if_all(all_of(needed), ~!is.na(.x))) %>%
+    filter(.data[[weight_var]] > 0)
+  
+  if (nrow(model_data) < 100) return(NULL)
+  if (length(unique(model_data$Depression)) < 2) return(NULL)
+  
+  des <- svydesign(
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = as.formula(paste0("~", weight_var)),
+    nest = TRUE,
+    data = model_data
+  )
+  
+  fit_base <- tryCatch(
+    svyglm(
+      as.formula(
+        paste(
+          "Depression ~",
+          paste(c("CMB_Score", covars), collapse = " + ")
+        )
+      ),
+      design = des,
+      family = quasibinomial()
+    ),
+    error = function(e) NULL
+  )
+  
+  fit_adj <- tryCatch(
+    svyglm(
+      as.formula(
+        paste(
+          "Depression ~",
+          paste(c("CMB_Score", biomarker_z, covars), collapse = " + ")
+        )
+      ),
+      design = des,
+      family = quasibinomial()
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(fit_base) || is.null(fit_adj)) return(NULL)
+  
+  cf0 <- summary(fit_base)$coefficients
+  cf1 <- summary(fit_adj)$coefficients
+  
+  if (!"CMB_Score" %in% rownames(cf0)) return(NULL)
+  if (!"CMB_Score" %in% rownames(cf1)) return(NULL)
+  
+  tibble(
+    n = nrow(model_data),
+    b0 = cf0["CMB_Score", "Estimate"],
+    se_b0 = cf0["CMB_Score", "Std. Error"],
+    b1 = cf1["CMB_Score", "Estimate"],
+    se_b1 = cf1["CMB_Score", "Std. Error"]
+  )
+}
+
+result_list <- list()
+
+for (i in seq_len(nrow(log_decision))) {
+  
+  b <- log_decision$biomarker[i]
+  z <- paste0(b, "_z")
+  label <- log_decision$label[i]
+  panel <- log_decision$panel[i]
+  weight_var <- log_decision$weight_var[i]
+  
+  cat("Running biomarker:", label, "\n")
+  
+  cmb_to_bio_raw <- map_dfr(
+    analysis_list,
+    ~fit_cmb_to_biomarker_one(.x, z, weight_var, covars)
+  )
+  
+  bio_to_dep_raw <- map_dfr(
+    analysis_list,
+    ~fit_biomarker_to_dep_one(.x, z, weight_var, covars)
+  )
+  
+  atten_raw <- map_dfr(
+    analysis_list,
+    ~fit_attenuation_components_one(.x, z, weight_var, covars)
+  )
+  
+  pooled_cmb_to_bio <- pool_rubin(cmb_to_bio_raw$beta, cmb_to_bio_raw$se)
+  pooled_bio_to_dep <- pool_rubin(bio_to_dep_raw$beta, bio_to_dep_raw$se)
+  pooled_b0 <- pool_rubin(atten_raw$b0, atten_raw$se_b0)
+  pooled_b1 <- pool_rubin(atten_raw$b1, atten_raw$se_b1)
+  
+  base_significant_pooled <- !is.na(pooled_b0$estimate) &&
+    !is.na(pooled_b0$se) &&
+    abs(pooled_b0$estimate / pooled_b0$se) >= 1.96
+  
+  if (base_significant_pooled) {
+    
+    attenuation_pct <- 100 * (pooled_b0$estimate - pooled_b1$estimate) / pooled_b0$estimate
+    
+    attenuation_se <- delta_atten_pooled(
+      b0 = pooled_b0$estimate,
+      b1 = pooled_b1$estimate,
+      se_b0 = pooled_b0$se,
+      se_b1 = pooled_b1$se
+    )
+    
+    attenuation_lower <- attenuation_pct - 1.96 * attenuation_se
+    attenuation_upper <- attenuation_pct + 1.96 * attenuation_se
+    
+    attenuation_status <- "Reported descriptively"
+    
+  } else {
+    
+    attenuation_pct <- NA_real_
+    attenuation_se <- NA_real_
+    attenuation_lower <- NA_real_
+    attenuation_upper <- NA_real_
+    
+    attenuation_status <- "Suppressed because pooled base CMB effect was non-significant"
+  }
+  
+  result_list[[b]] <- tibble(
+    biomarker = b,
+    label = label,
+    panel = panel,
+    weight_var = weight_var,
+    do_log = log_decision$do_log[i],
+    skewness_observed = log_decision$skewness_observed[i],
+    
+    n_cmb_to_bio_median = ifelse(nrow(cmb_to_bio_raw) > 0, median(cmb_to_bio_raw$n), NA_real_),
+    beta_cmb_to_bio = pooled_cmb_to_bio$estimate,
+    se_cmb_to_bio = pooled_cmb_to_bio$se,
+    p_cmb_to_bio = pooled_cmb_to_bio$p,
+    
+    n_bio_to_dep_median = ifelse(nrow(bio_to_dep_raw) > 0, median(bio_to_dep_raw$n), NA_real_),
+    beta_bio_to_dep = pooled_bio_to_dep$estimate,
+    se_bio_to_dep = pooled_bio_to_dep$se,
+    OR_bio_to_dep = exp(pooled_bio_to_dep$estimate),
+    lower_bio_to_dep = exp(pooled_bio_to_dep$lower),
+    upper_bio_to_dep = exp(pooled_bio_to_dep$upper),
+    p_bio_to_dep = pooled_bio_to_dep$p,
+    
+    n_attenuation_median = ifelse(nrow(atten_raw) > 0, median(atten_raw$n), NA_real_),
+    beta_cmb_base_pooled = pooled_b0$estimate,
+    se_cmb_base_pooled = pooled_b0$se,
+    p_cmb_base_pooled = pooled_b0$p,
+    beta_cmb_adjusted_pooled = pooled_b1$estimate,
+    se_cmb_adjusted_pooled = pooled_b1$se,
+    p_cmb_adjusted_pooled = pooled_b1$p,
+    pooled_base_cmb_significant = base_significant_pooled,
+    attenuation_pct = attenuation_pct,
+    attenuation_se = attenuation_se,
+    attenuation_lower = attenuation_lower,
+    attenuation_upper = attenuation_upper,
+    attenuation_status = attenuation_status
+  )
+}
+
+pooled_results <- bind_rows(result_list)
+
+pooled_results <- pooled_results %>%
+  mutate(
+    p_cmb_to_bio_FDR = p.adjust(p_cmb_to_bio, method = "fdr"),
+    p_bio_to_dep_FDR = p.adjust(p_bio_to_dep, method = "fdr"),
+    candidate_dual_fdr = p_cmb_to_bio_FDR < 0.05 & p_bio_to_dep_FDR < 0.05,
+    OR_95CI = mapply(fmt_ci, OR_bio_to_dep, lower_bio_to_dep, upper_bio_to_dep),
+    p_bio_to_dep_fmt = sapply(p_bio_to_dep, format_p),
+    p_bio_to_dep_FDR_fmt = sapply(p_bio_to_dep_FDR, format_p),
+    p_cmb_to_bio_fmt = sapply(p_cmb_to_bio, format_p),
+    p_cmb_to_bio_FDR_fmt = sapply(p_cmb_to_bio_FDR, format_p)
+  )
+
+write.csv(
+  pooled_results,
+  file.path(tab_dir, "Step24_v5_full_biomarker_results_with_attenuation_table.csv"),
+  row.names = FALSE
+)
+
+publication_table <- pooled_results %>%
+  transmute(
+    biomarker,
+    biomarker_label = label,
+    biomarker_panel = panel,
+    effective_n = round(n_bio_to_dep_median),
+    OR_per_1SD_biomarker = round(OR_bio_to_dep, 3),
+    lower_95CI = round(lower_bio_to_dep, 3),
+    upper_95CI = round(upper_bio_to_dep, 3),
+    OR_95CI,
+    p_value = p_bio_to_dep_fmt,
+    FDR_p_value = p_bio_to_dep_FDR_fmt,
+    CMB_to_biomarker_p = p_cmb_to_bio_fmt,
+    CMB_to_biomarker_FDR_p = p_cmb_to_bio_FDR_fmt,
+    dual_FDR_candidate = candidate_dual_fdr,
+    attenuation_pct = round(attenuation_pct, 3),
+    attenuation_lower_95CI = round(attenuation_lower, 3),
+    attenuation_upper_95CI = round(attenuation_upper, 3),
+    attenuation_status
+  )
+
+write.csv(
+  publication_table,
+  file.path(tab_dir, "TableS_Biomarker_exploratory_results.csv"),
+  row.names = FALSE
+)
+
+qc_summary <- tibble(
+  item = c(
+    "n_imputations",
+    "n_biomarkers_tested",
+    "dual_FDR_candidates",
+    "attenuation_figure_generated",
+    "max_abs_reported_attenuation_pct",
+    "max_abs_reported_attenuation_CI_bound"
+  ),
+  value = c(
+    length(mi_list),
+    nrow(pooled_results),
+    sum(pooled_results$candidate_dual_fdr, na.rm = TRUE),
+    "No",
+    ifelse(
+      all(is.na(pooled_results$attenuation_pct)),
+      NA_real_,
+      max(abs(pooled_results$attenuation_pct), na.rm = TRUE)
+    ),
+    ifelse(
+      all(is.na(c(pooled_results$attenuation_lower, pooled_results$attenuation_upper))),
+      NA_real_,
+      max(abs(c(pooled_results$attenuation_lower, pooled_results$attenuation_upper)), na.rm = TRUE)
+    )
+  )
+)
+
+write.csv(
+  qc_summary,
+  file.path(out_dir, "Step24_v5_QC_04_final_summary.csv"),
+  row.names = FALSE
+)
+
+panel_cols <- c(
+  "BIOPRO"  = "#009E73",
+  "CBC"     = "#0072B2",
+  "Fasting" = "#999999",
+  "HDL"     = "#56B4E9",
+  "hsCRP"   = "#D55E00",
+  "Lipid"   = "#E69F00",
+  "TCHOL"   = "#CC79A7"
+)
+
+plot_dat <- pooled_results %>%
+  filter(!is.na(OR_bio_to_dep)) %>%
+  arrange(panel, label) %>%
+  mutate(
+    label_plot = factor(label, levels = rev(label)),
+    sig_shape = ifelse(candidate_dual_fdr, "Dual FDR < 0.05", "FDR ≥ 0.05")
+  )
+
+p_forest <- ggplot(
+  plot_dat,
+  aes(
+    x = OR_bio_to_dep,
+    y = label_plot,
+    colour = panel
+  )
+) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    linewidth = 0.45,
+    colour = "grey40"
+  ) +
+  geom_errorbar(
+    aes(
+      xmin = lower_bio_to_dep,
+      xmax = upper_bio_to_dep
+    ),
+    orientation = "y",
+    width = 0.18,
+    linewidth = 0.45
+  ) +
+  geom_point(
+    aes(shape = sig_shape),
+    size = 2.7,
+    stroke = 0.9
+  ) +
+  scale_colour_manual(
+    values = panel_cols,
+    guide = "none"
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Dual FDR < 0.05" = 15,
+      "FDR ≥ 0.05" = 1
+    ),
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.03, 0.05))
+  ) +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    plot.caption = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_text(size = 8.8, colour = "black"),
+    axis.text.x = element_text(size = 10, colour = "black"),
+    legend.position = "none",
+    plot.margin = margin(8, 8, 8, 8)
+  )
+
+ggsave(
+  file.path(fig_dir, "Step24_v5_Forest_Biomarker_to_Depression_no_legend_no_xlabel.tiff"),
+  p_forest,
+  width = 7.0,
+  height = 9.2,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  file.path(fig_dir, "Step24_v5_Forest_Biomarker_to_Depression_no_legend_no_xlabel.pdf"),
+  p_forest,
+  width = 7.0,
+  height = 9.2,
+  units = "in",
+  device = cairo_pdf
+)
+
+writeLines(
+  c(
+    "Figure note to place in manuscript/supplement caption, not inside figure:",
+    "Colours indicate biomarker panels: BIOPRO, CBC, fasting lipids, HDL, hs-CRP, lipid-derived markers, and total cholesterol.",
+    "Point shapes indicate whether the biomarker met the dual-FDR criterion.",
+    "Effective sample sizes, ORs, FDR-adjusted P values, and attenuation estimates are provided in the supplementary biomarker table.",
+    "Attenuation estimates were retained in the table only and were not displayed as a figure because estimates were small and uncertainty intervals were wide."
+  ),
+  con = file.path(fig_dir, "Step24_v5_Figure_caption_notes_NOT_inside_figure.txt")
+)
+
+cat("\n============================================================\n")
+cat("STEP 24-MI v5 FINAL COMPLETE\n")
+cat("============================================================\n")
+cat("Forest plot saved without legend, without x-axis title, and without extra annotations.\n")
+cat("Attenuation figure was not generated.\n")
+cat("Tables saved in:\n", tab_dir, "\n")
+cat("Figures saved in:\n", fig_dir, "\n")
+cat("============================================================\n")
