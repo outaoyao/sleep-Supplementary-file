@@ -1,0 +1,1043 @@
+################################################################################
+# SCRIPT: 13. Publication-ready Tables for NHANES Manuscript
+#
+# Outputs:
+#   1. Table1_Main_MI_Eligible.csv
+#   2. TableS1_Included_vs_Excluded_SMD.csv
+#   3. TableS2_MI_Covariate_Missingness.csv
+#   4. TableS4_CompleteCase_Table1.csv
+#
+# Main updates:
+#   - Fixed Unicode issues (direct UTF-8 symbols used)
+#   - Added 18–19 years age group
+#   - Standardized publication-ready table headers
+#   - MI = primary analysis
+#   - Complete-case = exploratory spline analyses
+################################################################################
+
+library(tidyverse)
+library(survey)
+library(forcats)
+
+options(survey.lonely.psu = "adjust")
+
+base_path <- "D:/code"
+setwd(base_path)
+
+qc_dir <- file.path(base_path, "qc_outputs")
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# =============================================================================
+# Load datasets
+# =============================================================================
+
+df_raw <- readRDS("11.Dataset.rds")
+
+df_mi <- readRDS("12.Dataset_MI_Eligible.rds")
+
+df_cc <- readRDS("12.Dataset_CompleteCase.rds")
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+fmt_p <- function(p) {
+  if (is.na(p)) return("—")
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+add_missing_level <- function(x) {
+  x <- factor(x)
+  forcats::fct_na_value_to_level(x, level = "Missing")
+}
+
+fmt_n_pct <- function(n, pct) {
+  sprintf("%d (%.2f%%)", n, pct)
+}
+
+fmt_mean_sd <- function(x) {
+  x <- x[!is.na(x)]
+  
+  if (length(x) == 0) return("—")
+  
+  sprintf("%.1f (%.1f)", mean(x), sd(x))
+}
+
+weighted_pct <- function(design, var, level, group = NULL) {
+  
+  d <- design
+  
+  if (!is.null(group)) {
+    d <- subset(d, PHQ9_group == group)
+  }
+  
+  tab <- svytable(as.formula(paste0("~", var)), d)
+  
+  if (!(level %in% names(tab))) return(0)
+  
+  as.numeric(tab[level] / sum(tab) * 100)
+}
+
+# =============================================================================
+# Prepare publication-ready variables
+# =============================================================================
+
+prepare_table_data <- function(data) {
+  
+  data %>%
+    mutate(
+      
+      # -----------------------------------------------------------------------
+      # PHQ-9 group
+      # -----------------------------------------------------------------------
+      
+      PHQ9_group = factor(
+        PHQ9_depression_above_10,
+        levels = c(0, 1),
+        labels = c("PHQ-9 <10", "PHQ-9 ≥10")
+      ),
+      
+      # -----------------------------------------------------------------------
+      # Age group
+      # -----------------------------------------------------------------------
+      
+      age_group_pub = case_when(
+        !is.na(RIDAGEYR) & RIDAGEYR >= 18 & RIDAGEYR < 20 ~ "18–19 years",
+        !is.na(RIDAGEYR) & RIDAGEYR >= 20 & RIDAGEYR < 40 ~ "20–39 years",
+        !is.na(RIDAGEYR) & RIDAGEYR >= 40 & RIDAGEYR < 60 ~ "40–59 years",
+        !is.na(RIDAGEYR) & RIDAGEYR >= 60 ~ "≥60 years",
+        TRUE ~ NA_character_
+      ),
+      
+      age_group_pub = factor(
+        age_group_pub,
+        levels = c(
+          "18–19 years",
+          "20–39 years",
+          "40–59 years",
+          "≥60 years"
+        )
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # Sex
+      # -----------------------------------------------------------------------
+      
+      sex_f = factor(
+        sex,
+        levels = c("Male", "Female")
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # Race
+      # -----------------------------------------------------------------------
+      
+      race_f = add_missing_level(race_ethnicity),
+      
+      # -----------------------------------------------------------------------
+      # Education
+      # -----------------------------------------------------------------------
+      
+      education_f = add_missing_level(education),
+      
+      # -----------------------------------------------------------------------
+      # Marital status
+      # -----------------------------------------------------------------------
+      
+      marital_f = add_missing_level(marital_status),
+      
+      # -----------------------------------------------------------------------
+      # Smoking
+      # -----------------------------------------------------------------------
+      
+      smoking_f = factor(
+        smoke_status,
+        levels = c(0, 1, 2),
+        labels = c(
+          "Never smoker",
+          "Former smoker",
+          "Current smoker"
+        )
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # Alcohol
+      # -----------------------------------------------------------------------
+      
+      alcohol_f = factor(
+        Alcohol_Status,
+        levels = c(0, 1, 2),
+        labels = c(
+          "Never",
+          "Non-heavy ever drinker",
+          "Heavy alcohol use"
+        )
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # Work status
+      # -----------------------------------------------------------------------
+      
+      work_f = factor(
+        work_status,
+        levels = c(0, 1),
+        labels = c(
+          "Currently employed",
+          "Not currently working"
+        )
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # Diabetes
+      # -----------------------------------------------------------------------
+      
+      diabetes_f = factor(
+        diabetes_or_prediabetes,
+        levels = c(0, 1),
+        labels = c(
+          "No",
+          "Diabetes/prediabetes"
+        )
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # Hypertension
+      # -----------------------------------------------------------------------
+      
+      htn_f = factor(
+        htn_status,
+        levels = c(0, 1),
+        labels = c(
+          "No",
+          "Yes"
+        )
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # PIR
+      # -----------------------------------------------------------------------
+      
+      PIR_cat_f = add_missing_level(PIR_cat),
+      
+      # -----------------------------------------------------------------------
+      # BMI
+      # -----------------------------------------------------------------------
+      
+      BMI_cat_f = factor(
+        BMI_cat,
+        levels = c(
+          "Underweight",
+          "Normal",
+          "Overweight",
+          "Obese"
+        ),
+        labels = c(
+          "Underweight",
+          "Normal weight",
+          "Overweight",
+          "Obesity"
+        )
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # Weekday sleep duration
+      # -----------------------------------------------------------------------
+      
+      dur_wd_cat_f = factor(
+        dur_wd_cat,
+        levels = c(
+          "7-9 hours",
+          "<7 hours",
+          "≥9 hours"
+        ),
+        labels = c(
+          "7–9 h",
+          "<7 h",
+          "≥9 h"
+        )
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # Weekend sleep duration
+      # -----------------------------------------------------------------------
+      
+      dur_we_cat_f = factor(
+        dur_we_cat,
+        levels = c(
+          "7-9 hours",
+          "<7 hours",
+          "≥9 hours"
+        ),
+        labels = c(
+          "7–9 h",
+          "<7 h",
+          "≥9 h"
+        )
+      ) %>%
+        add_missing_level(),
+      
+      # -----------------------------------------------------------------------
+      # Physical activity
+      # -----------------------------------------------------------------------
+      
+      MET_cat_f = add_missing_level(MET_cat_label),
+      
+      # -----------------------------------------------------------------------
+      # Sedentary time
+      # -----------------------------------------------------------------------
+      
+      sedentary_cat_f = factor(
+        sedentary_cat_label,
+        levels = c("<6h", "6-8h", ">8h"),
+        labels = c(
+          "<6 h/day",
+          "6–8 h/day",
+          ">8 h/day"
+        )
+      ) %>%
+        add_missing_level()
+    )
+}
+
+# =============================================================================
+# Main Table 1 builder
+# =============================================================================
+
+make_table1 <- function(
+    data,
+    output_name,
+    remove_zero_missing = TRUE
+) {
+  
+  data <- prepare_table_data(data)
+  
+  design <- svydesign(
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = ~mec_adj,
+    nest = TRUE,
+    data = data
+  )
+  
+  table_vars <- c(
+    "sex_f",
+    "age_group_pub",
+    "race_f",
+    "education_f",
+    "marital_f",
+    "PIR_cat_f",
+    "BMI_cat_f",
+    "smoking_f",
+    "alcohol_f",
+    "work_f",
+    "diabetes_f",
+    "htn_f",
+    "dur_wd_cat_f",
+    "dur_we_cat_f",
+    "MET_cat_f",
+    "sedentary_cat_f"
+  )
+  
+  var_labels <- c(
+    sex_f = "Sex",
+    age_group_pub = "Age group",
+    race_f = "Race/ethnicity",
+    education_f = "Education",
+    marital_f = "Marital status",
+    PIR_cat_f = "Family income-to-poverty ratio",
+    BMI_cat_f = "BMI category",
+    smoking_f = "Smoking status",
+    alcohol_f = "Alcohol use",
+    work_f = "Work status",
+    diabetes_f = "Diabetes/prediabetes",
+    htn_f = "Hypertension",
+    dur_wd_cat_f = "Weekday sleep duration",
+    dur_we_cat_f = "Weekend sleep duration",
+    MET_cat_f = "Leisure-time physical activity",
+    sedentary_cat_f = "Sedentary time"
+  )
+  
+  dep_tab <- table(data$PHQ9_group)
+  
+  results <- list()
+  
+  # ---------------------------------------------------------------------------
+  # N row
+  # ---------------------------------------------------------------------------
+  
+  results[[1]] <- tibble(
+    Characteristic = "N",
+    Overall = as.character(nrow(data)),
+    PHQ9_lt10 = as.character(dep_tab["PHQ-9 <10"]),
+    PHQ9_ge10 = as.character(dep_tab["PHQ-9 ≥10"]),
+    P_value = ""
+  )
+  
+  # ---------------------------------------------------------------------------
+  # Variables
+  # ---------------------------------------------------------------------------
+  
+  for (var in table_vars) {
+    
+    p <- tryCatch(
+      
+      svychisq(
+        as.formula(paste0("~", var, " + PHQ9_group")),
+        design = design,
+        statistic = "Wald"
+      )$p.value,
+      
+      error = function(e) NA_real_
+    )
+    
+    results[[length(results) + 1]] <- tibble(
+      Characteristic = var_labels[[var]],
+      Overall = "",
+      PHQ9_lt10 = "",
+      PHQ9_ge10 = "",
+      P_value = fmt_p(p)
+    )
+    
+    for (lv in levels(data[[var]])) {
+      
+      n_all <- sum(data[[var]] == lv, na.rm = TRUE)
+      
+      n_no <- sum(
+        data[[var]] == lv &
+          data$PHQ9_group == "PHQ-9 <10",
+        na.rm = TRUE
+      )
+      
+      n_yes <- sum(
+        data[[var]] == lv &
+          data$PHQ9_group == "PHQ-9 ≥10",
+        na.rm = TRUE
+      )
+      
+      if (
+        remove_zero_missing &&
+        lv == "Missing" &&
+        n_all == 0 &&
+        n_no == 0 &&
+        n_yes == 0
+      ) next
+      
+      pct_all <- weighted_pct(design, var, lv)
+      
+      pct_no <- weighted_pct(
+        design,
+        var,
+        lv,
+        "PHQ-9 <10"
+      )
+      
+      pct_yes <- weighted_pct(
+        design,
+        var,
+        lv,
+        "PHQ-9 ≥10"
+      )
+      
+      results[[length(results) + 1]] <- tibble(
+        Characteristic = paste0("  ", lv),
+        Overall = fmt_n_pct(n_all, pct_all),
+        PHQ9_lt10 = fmt_n_pct(n_no, pct_no),
+        PHQ9_ge10 = fmt_n_pct(n_yes, pct_yes),
+        P_value = ""
+      )
+    }
+  }
+  
+  # ---------------------------------------------------------------------------
+  # Final table
+  # ---------------------------------------------------------------------------
+  
+  table1 <- bind_rows(results) %>%
+    rename(
+      `PHQ-9 <10` = PHQ9_lt10,
+      `PHQ-9 ≥10` = PHQ9_ge10,
+      `P value` = P_value
+    )
+  
+  write.csv(
+    table1,
+    file.path(base_path, output_name),
+    row.names = FALSE,
+    na = "",
+    fileEncoding = "UTF-8"
+  )
+  
+  # ---------------------------------------------------------------------------
+  # Console summary
+  # ---------------------------------------------------------------------------
+  
+  weighted_pop <- sum(weights(design))
+  
+  weighted_dep <- svytable(~PHQ9_group, design)
+  
+  cat("\nSaved:", output_name, "\n")
+  
+  cat("Unweighted N:",
+      nrow(data),
+      "\n")
+  
+  cat(
+    "Weighted population:",
+    format(round(weighted_pop), big.mark = ","),
+    "\n"
+  )
+  
+  cat(
+    "Weighted depressive symptoms:",
+    format(round(weighted_dep["PHQ-9 ≥10"]), big.mark = ","),
+    sprintf(
+      "(%.2f%%)\n",
+      prop.table(weighted_dep)["PHQ-9 ≥10"] * 100
+    )
+  )
+  
+  invisible(table1)
+}
+
+# =============================================================================
+# Generate main Table 1
+# =============================================================================
+
+table1_main <- make_table1(
+  data = df_mi,
+  output_name = "Table1_Main_MI_Eligible.csv",
+  remove_zero_missing = TRUE
+)
+
+# =============================================================================
+# Generate complete-case Table S4
+# =============================================================================
+
+table1_cc <- make_table1(
+  data = df_cc,
+  output_name = "TableS4_CompleteCase_Table1.csv",
+  remove_zero_missing = TRUE
+)
+
+# =============================================================================
+# Table S1: Included vs excluded comparison with SMD
+# =============================================================================
+
+cat("\nGenerating Table S1...\n")
+
+df_raw_smd <- df_raw %>%
+  mutate(
+    
+    inclusion_group = factor(
+      ifelse(SEQN %in% df_mi$SEQN,
+             "Included",
+             "Excluded"),
+      levels = c("Included", "Excluded")
+    ),
+    
+    age_cont = RIDAGEYR,
+    
+    bmi_cont = BMI_value,
+    
+    sex_f = factor(sex),
+    
+    race_f = factor(race_ethnicity),
+    
+    education_f = factor(education),
+    
+    marital_f = factor(marital_status),
+    
+    smoking_f = factor(
+      smoke_status,
+      levels = c(0, 1, 2),
+      labels = c(
+        "Never smoker",
+        "Former smoker",
+        "Current smoker"
+      )
+    ),
+    
+    alcohol_f = factor(
+      Alcohol_Status,
+      levels = c(0, 1, 2),
+      labels = c(
+        "Never",
+        "Non-heavy ever drinker",
+        "Heavy alcohol use"
+      )
+    ),
+    
+    diabetes_f = factor(
+      diabetes_or_prediabetes,
+      levels = c(0, 1),
+      labels = c(
+        "No",
+        "Diabetes/prediabetes"
+      )
+    ),
+    
+    htn_f = factor(
+      htn_status,
+      levels = c(0, 1),
+      labels = c(
+        "No",
+        "Yes"
+      )
+    ),
+    
+    work_f = factor(
+      work_status,
+      levels = c(0, 1),
+      labels = c(
+        "Currently employed",
+        "Not currently working"
+      )
+    ),
+    
+    phq_available = factor(
+      !is.na(PHQ9_SCORE),
+      levels = c(TRUE, FALSE),
+      labels = c(
+        "Available",
+        "Missing"
+      )
+    ),
+    
+    sleep_available = factor(
+      !is.na(sleep_onset_wd_min) &
+        !is.na(wake_time_wd_min) &
+        !is.na(midpoint_wd_min) &
+        !is.na(sleep_onset_we_min) &
+        !is.na(wake_time_we_min) &
+        !is.na(midpoint_we_min),
+      
+      levels = c(TRUE, FALSE),
+      
+      labels = c(
+        "Complete",
+        "Incomplete/missing"
+      )
+    )
+  )
+
+incl <- df_raw_smd %>%
+  filter(inclusion_group == "Included")
+
+excl <- df_raw_smd %>%
+  filter(inclusion_group == "Excluded")
+
+# =============================================================================
+# SMD functions
+# =============================================================================
+
+fmt_n_pct_raw <- function(n, denom) {
+  
+  if (is.na(denom) || denom == 0) return("—")
+  
+  sprintf(
+    "%d (%.1f%%)",
+    n,
+    100 * n / denom
+  )
+}
+
+smd_cont <- function(x, group) {
+  
+  g <- levels(group)
+  
+  x1 <- x[group == g[1] & !is.na(x)]
+  
+  x2 <- x[group == g[2] & !is.na(x)]
+  
+  if (length(x1) < 2 || length(x2) < 2) {
+    return(NA_real_)
+  }
+  
+  pooled_sd <- sqrt(
+    (
+      ((length(x1) - 1) * var(x1)) +
+        ((length(x2) - 1) * var(x2))
+    ) /
+      (length(x1) + length(x2) - 2)
+  )
+  
+  if (is.na(pooled_sd) || pooled_sd == 0) {
+    return(0)
+  }
+  
+  abs(mean(x1) - mean(x2)) / pooled_sd
+}
+
+smd_binary <- function(p1, p2) {
+  
+  if (any(is.na(c(p1, p2)))) {
+    return(NA_real_)
+  }
+  
+  abs(
+    2 * asin(sqrt(p1)) -
+      2 * asin(sqrt(p2))
+  )
+}
+
+smd_cat <- function(x, group) {
+  
+  x <- factor(x)
+  
+  g <- levels(group)
+  
+  smds <- sapply(levels(x), function(lv) {
+    
+    p1 <- mean(
+      x[group == g[1]] == lv,
+      na.rm = TRUE
+    )
+    
+    p2 <- mean(
+      x[group == g[2]] == lv,
+      na.rm = TRUE
+    )
+    
+    smd_binary(p1, p2)
+  })
+  
+  max(smds, na.rm = TRUE)
+}
+
+safe_chisq <- function(x, group) {
+  
+  tbl <- table(
+    x,
+    group,
+    useNA = "no"
+  )
+  
+  tryCatch(
+    
+    chisq.test(
+      tbl,
+      simulate.p.value = TRUE,
+      B = 5000
+    )$p.value,
+    
+    error = function(e) NA_real_
+  )
+}
+
+safe_ttest <- function(x, group) {
+  
+  g <- levels(group)
+  
+  tryCatch(
+    
+    t.test(
+      x[group == g[1]],
+      x[group == g[2]]
+    )$p.value,
+    
+    error = function(e) NA_real_
+  )
+}
+
+# =============================================================================
+# Build Table S1
+# =============================================================================
+
+smd_rows <- list()
+
+add_smd_row <- function(
+    characteristic,
+    total,
+    included,
+    excluded,
+    p_value = "",
+    smd = ""
+) {
+  
+  smd_rows[[length(smd_rows) + 1]] <<- tibble(
+    Characteristic = characteristic,
+    Total = total,
+    Included = included,
+    Excluded = excluded,
+    `P value` = p_value,
+    SMD = smd
+  )
+}
+
+add_smd_section <- function(label) {
+  
+  add_smd_row(
+    label,
+    "",
+    "",
+    "",
+    "",
+    ""
+  )
+}
+
+add_smd_cont <- function(label, var) {
+  
+  p <- safe_ttest(
+    df_raw_smd[[var]],
+    df_raw_smd$inclusion_group
+  )
+  
+  s <- smd_cont(
+    df_raw_smd[[var]],
+    df_raw_smd$inclusion_group
+  )
+  
+  add_smd_section(label)
+  
+  add_smd_row(
+    "  Mean (SD)",
+    fmt_mean_sd(df_raw_smd[[var]]),
+    fmt_mean_sd(incl[[var]]),
+    fmt_mean_sd(excl[[var]]),
+    fmt_p(p),
+    sprintf("%.3f", s)
+  )
+}
+
+add_smd_cat <- function(label, var) {
+  
+  x_total <- factor(df_raw_smd[[var]])
+  
+  x_inc <- factor(
+    incl[[var]],
+    levels = levels(x_total)
+  )
+  
+  x_exc <- factor(
+    excl[[var]],
+    levels = levels(x_total)
+  )
+  
+  p <- safe_chisq(
+    x_total,
+    df_raw_smd$inclusion_group
+  )
+  
+  s <- smd_cat(
+    x_total,
+    df_raw_smd$inclusion_group
+  )
+  
+  add_smd_section(label)
+  
+  denom_total <- sum(!is.na(x_total))
+  
+  denom_inc <- sum(!is.na(x_inc))
+  
+  denom_exc <- sum(!is.na(x_exc))
+  
+  for (i in seq_along(levels(x_total))) {
+    
+    lv <- levels(x_total)[i]
+    
+    add_smd_row(
+      paste0("  ", lv),
+      
+      fmt_n_pct_raw(
+        sum(x_total == lv, na.rm = TRUE),
+        denom_total
+      ),
+      
+      fmt_n_pct_raw(
+        sum(x_inc == lv, na.rm = TRUE),
+        denom_inc
+      ),
+      
+      fmt_n_pct_raw(
+        sum(x_exc == lv, na.rm = TRUE),
+        denom_exc
+      ),
+      
+      ifelse(i == 1, fmt_p(p), ""),
+      
+      ifelse(i == 1,
+             sprintf("%.3f", s),
+             "")
+    )
+  }
+}
+
+# =============================================================================
+# Add rows
+# =============================================================================
+
+add_smd_row(
+  "N",
+  as.character(nrow(df_raw_smd)),
+  as.character(nrow(incl)),
+  as.character(nrow(excl))
+)
+
+add_smd_cont("Age, years", "age_cont")
+
+add_smd_cat("Sex", "sex_f")
+
+add_smd_cat("Race/ethnicity", "race_f")
+
+add_smd_cat("Education", "education_f")
+
+add_smd_cont("BMI, kg/m²", "bmi_cont")
+
+add_smd_cat("Marital status", "marital_f")
+
+add_smd_cat("Smoking status", "smoking_f")
+
+add_smd_cat("Alcohol use", "alcohol_f")
+
+add_smd_cat("Diabetes/prediabetes", "diabetes_f")
+
+add_smd_cat("Hypertension", "htn_f")
+
+add_smd_cat("Work status", "work_f")
+
+add_smd_cat("PHQ-9 availability", "phq_available")
+
+add_smd_cat(
+  "Core sleep variable availability",
+  "sleep_available"
+)
+
+table_s1 <- bind_rows(smd_rows)
+
+write.csv(
+  table_s1,
+  file.path(
+    base_path,
+    "TableS1_Included_vs_Excluded_SMD.csv"
+  ),
+  row.names = FALSE,
+  na = "",
+  fileEncoding = "UTF-8"
+)
+
+cat(
+  "Saved: TableS1_Included_vs_Excluded_SMD.csv\n"
+)
+
+# =============================================================================
+# Table S2: Missingness before MI
+# =============================================================================
+
+cat("\nGenerating Table S2...\n")
+
+mi_covariates <- c(
+  "RIDAGEYR",
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "INDFMPIR",
+  "PIR_cat",
+  "BMI_value",
+  "BMI_cat",
+  "smoke_status",
+  "Alcohol_Status",
+  "diabetes_or_prediabetes",
+  "htn_status",
+  "work_status",
+  "MET_total",
+  "MET_cat_label",
+  "sedentary_min",
+  "sedentary_cat_label"
+)
+
+missing_labels <- c(
+  RIDAGEYR = "Age",
+  sex = "Sex",
+  race_ethnicity = "Race/ethnicity",
+  education = "Education",
+  marital_status = "Marital status",
+  INDFMPIR = "Family income-to-poverty ratio",
+  PIR_cat = "PIR category",
+  BMI_value = "BMI",
+  BMI_cat = "BMI category",
+  smoke_status = "Smoking status",
+  Alcohol_Status = "Alcohol use",
+  diabetes_or_prediabetes = "Diabetes/prediabetes",
+  htn_status = "Hypertension",
+  work_status = "Work status",
+  MET_total = "Leisure-time physical activity, MET-min/week",
+  MET_cat_label = "Leisure-time physical activity category",
+  sedentary_min = "Sedentary time, min/day",
+  sedentary_cat_label = "Sedentary time category"
+)
+
+table_s2 <- tibble(
+  Variable = mi_covariates,
+  
+  Label = missing_labels[mi_covariates],
+  
+  Missing_n = map_int(
+    mi_covariates,
+    ~ sum(is.na(df_mi[[.x]]))
+  ),
+  
+  Total_N = nrow(df_mi),
+  
+  Missing_percent = round(
+    100 * Missing_n / Total_N,
+    2
+  )
+) %>%
+  arrange(
+    desc(Missing_percent),
+    Variable
+  )
+
+write.csv(
+  table_s2,
+  file.path(
+    base_path,
+    "TableS2_MI_Covariate_Missingness.csv"
+  ),
+  row.names = FALSE,
+  na = "",
+  fileEncoding = "UTF-8"
+)
+
+cat(
+  "Saved: TableS2_MI_Covariate_Missingness.csv\n"
+)
+
+# =============================================================================
+# Final summary
+# =============================================================================
+
+cat("\nAll publication-ready tables generated successfully.\n")
+
+cat(
+  "Main Table 1: Table1_Main_MI_Eligible.csv\n"
+)
+
+cat(
+  "Table S1: TableS1_Included_vs_Excluded_SMD.csv\n"
+)
+
+cat(
+  "Table S2: TableS2_MI_Covariate_Missingness.csv\n"
+)
+
+cat(
+  "Table S4: TableS4_CompleteCase_Table1.csv\n"
+)
+
+summary(df_raw$RIDAGEYR)
+table(df_raw$RIDAGEYR < 18, useNA="always")
