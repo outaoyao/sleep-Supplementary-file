@@ -1,0 +1,1332 @@
+################################################################################
+# STEP 19 SENSITIVITY ANALYSES — PHQ-9 OUTCOME VARIANTS
+#
+# Three sensitivity analyses, each structured identically to the Step 19
+# main analysis.  Run each block independently or source the full file.
+#
+#   SA1  PHQ-9 >= 15
+#          Participants with daily suicidal ideation excluded (DPQ090 == 3).
+#
+#   SA2  Modified PHQ-9 (sleep item DPQ030 removed) >= 10
+#          Participants with daily suicidal ideation excluded.
+#
+#   SA3  Modified PHQ-9 (sleep item DPQ030 removed) >= 9
+#          Participants with daily suicidal ideation excluded.
+#
+# Each SA produces, in its own sub-folder:
+#   _main_results.csv
+#   _standardized_OR.csv
+#   _trend_result.csv
+#   _publication_ready_table.csv
+#   figures/_forest_plot.tiff / .pdf / .png
+#   _QC_summary.csv
+################################################################################
+
+rm(list = ls())
+
+library(survey)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+
+options(survey.lonely.psu = "adjust")
+
+root_dir  <- "D:/code"
+data_path <- file.path(root_dir, "18.MI_Eligible_CMB_scored_by_main_rules.rds")
+
+if (!file.exists(data_path)) {
+  stop("Cannot find: ", data_path)
+}
+
+dat_full <- as.data.frame(readRDS(data_path))
+
+cat("Dataset loaded — rows:", nrow(dat_full), "  cols:", ncol(dat_full), "\n\n")
+
+# Shared covariate lists (identical to Step 19 main analysis)
+model2_covars <- c(
+  "RIDAGEYR",
+  "sex",
+  "race_ethnicity"
+)
+
+model3_covars <- c(
+  model2_covars,
+  "education",
+  "marital_status",
+  "smoke_label",
+  "BMI_value",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label",
+  "MET_total",
+  "INDFMPIR"
+)
+
+model4_covars <- c(
+  model3_covars,
+  "sedentary_min"
+)
+
+factor_vars <- c(
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "smoke_label",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label"
+)
+
+for (v in factor_vars) {
+  if (v %in% names(dat_full)) dat_full[[v]] <- as.factor(dat_full[[v]])
+}
+
+# Shared helper functions (identical to Step 19 main analysis)
+format_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", round(p, 3))
+}
+
+extract_or <- function(model, label, var_name) {
+  cf  <- summary(model)$coefficients
+  if (!var_name %in% rownames(cf)) stop("Variable not found in model: ", var_name)
+  est <- cf[var_name, "Estimate"]
+  se  <- cf[var_name, "Std. Error"]
+  p   <- cf[var_name, "Pr(>|t|)"]
+  data.frame(
+    Model   = label,
+    beta    = est,
+    se      = se,
+    OR      = exp(est),
+    lower95 = exp(est - 1.96 * se),
+    upper95 = exp(est + 1.96 * se),
+    p_value = p,
+    p_fmt   = format_p(p),
+    stringsAsFactors = FALSE
+  )
+}
+
+
+################################################################################
+# ============================================================
+# SA1 — PHQ-9 >= 15
+#        Excluding daily suicidal ideation (DPQ090 == 3)
+# ============================================================
+################################################################################
+
+# ==============================================================================
+# SA1-0.  Paths
+# ==============================================================================
+
+out_dir_sa1 <- file.path(root_dir, "Step19_Sensitivity_PHQ9_Variants",
+                         "SA1_PHQ9_ge15")
+fig_dir_sa1 <- file.path(out_dir_sa1, "figures")
+dir.create(out_dir_sa1, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir_sa1, recursive = TRUE, showWarnings = FALSE)
+
+# ==============================================================================
+# SA1-1.  Outcome variable
+# ==============================================================================
+
+outcome_var_sa1  <- "PHQ9_depression_above_15"
+exposure_var_sa1 <- "CMB_Score_MI_main_rules"
+
+# ==============================================================================
+# SA1-2.  Exclude daily suicidal ideation; build analysis dataset
+# ==============================================================================
+
+dat_sa1 <- dat_full
+dat_sa1[[outcome_var_sa1]] <- ifelse(
+  !is.na(dat_sa1$suicidal_ideation_daily) & dat_sa1$suicidal_ideation_daily == 1,
+  NA_real_,
+  dat_sa1[[outcome_var_sa1]]
+)
+
+required_vars_sa1 <- unique(c(
+  "SEQN", "SDMVPSU", "SDMVSTRA", "mec_adj",
+  outcome_var_sa1, exposure_var_sa1, model4_covars
+))
+
+missing_vars_sa1 <- setdiff(required_vars_sa1, names(dat_sa1))
+if (length(missing_vars_sa1) > 0) {
+  stop("SA1 — missing variables: ", paste(missing_vars_sa1, collapse = ", "))
+}
+
+# ==============================================================================
+# SA1-3.  Missingness audit
+# ==============================================================================
+
+missing_audit_sa1 <- data.frame(
+  variable    = required_vars_sa1,
+  n_missing   = sapply(required_vars_sa1, function(v) sum(is.na(dat_sa1[[v]]))),
+  missing_pct = sapply(
+    required_vars_sa1,
+    function(v) mean(is.na(dat_sa1[[v]])) * 100
+  )
+)
+
+write.csv(
+  missing_audit_sa1,
+  file.path(out_dir_sa1, "SA1_PHQ9_ge15_missingness_audit.csv"),
+  row.names = FALSE
+)
+
+cat("\nSA1 missingness audit:\n")
+print(missing_audit_sa1)
+
+# ==============================================================================
+# SA1-4.  Factor handling and analysis dataset
+# ==============================================================================
+
+dat_sa1 <- dat_sa1 %>%
+  dplyr::select(all_of(required_vars_sa1)) %>%
+  dplyr::filter(
+    !is.na(.data[[outcome_var_sa1]]),
+    !is.na(.data[[exposure_var_sa1]]),
+    !is.na(SDMVPSU),
+    !is.na(SDMVSTRA),
+    !is.na(mec_adj),
+    mec_adj  > 0,
+    SDMVPSU  > 0,
+    SDMVSTRA > 0
+  ) %>%
+  mutate(
+    CMB_z = as.numeric(scale(.data[[exposure_var_sa1]]))
+  )
+
+cat("\nSA1 analysis N:", nrow(dat_sa1), "\n")
+cat("SA1 removed N :", nrow(dat_full) - nrow(dat_sa1), "\n")
+
+cat("\nSA1 outcome distribution:\n")
+print(table(dat_sa1[[outcome_var_sa1]], useNA = "ifany"))
+
+cat("\nSA1 CMB distribution:\n")
+print(summary(dat_sa1[[exposure_var_sa1]]))
+
+# ==============================================================================
+# SA1-5.  Survey design
+# ==============================================================================
+
+design_sa1 <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data    = dat_sa1,
+  nest    = TRUE
+)
+
+# ==============================================================================
+# SA1-6.  Correct weighted quartiles
+# ==============================================================================
+
+q_cut_sa1 <- svyquantile(
+  as.formula(paste0("~", exposure_var_sa1)),
+  design    = design_sa1,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm     = TRUE,
+  ci        = FALSE
+)
+
+q_values_sa1 <- sort(unique(as.numeric(coef(q_cut_sa1))))
+
+if (length(q_values_sa1) < 3) {
+  stop("SA1 — weighted quartile cut points are not sufficiently unique.")
+}
+
+dat_sa1 <- dat_sa1 %>%
+  mutate(
+    CMB_Q = cut(
+      .data[[exposure_var_sa1]],
+      breaks         = q_values_sa1,
+      include.lowest = TRUE,
+      labels         = FALSE
+    ),
+    CMB_Trend = as.numeric(CMB_Q)
+  )
+
+if (any(is.na(dat_sa1$CMB_Q))) {
+  stop("SA1 — CMB_Q contains NA after weighted quartile construction.")
+}
+
+design_sa1 <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data    = dat_sa1,
+  nest    = TRUE
+)
+
+cat("\nSA1 weighted quartile cutpoints:\n")
+print(q_values_sa1)
+
+cat("\nSA1 CMB quartile distribution:\n")
+print(table(dat_sa1$CMB_Q, useNA = "ifany"))
+
+# ==============================================================================
+# SA1-7.  Helper functions
+# ==============================================================================
+
+make_formula_sa1 <- function(exposure, covars = NULL) {
+  rhs <- c(exposure, covars)
+  as.formula(paste(outcome_var_sa1, "~", paste(rhs, collapse = " + ")))
+}
+
+fit_model_sa1 <- function(exposure, covars = NULL) {
+  svyglm(
+    formula = make_formula_sa1(exposure, covars),
+    design  = design_sa1,
+    family  = quasibinomial()
+  )
+}
+
+# ==============================================================================
+# SA1-8.  Four models
+# ==============================================================================
+
+model1_sa1 <- fit_model_sa1(exposure_var_sa1, NULL)
+model2_sa1 <- fit_model_sa1(exposure_var_sa1, model2_covars)
+model3_sa1 <- fit_model_sa1(exposure_var_sa1, model3_covars)
+model4_sa1 <- fit_model_sa1(exposure_var_sa1, model4_covars)
+
+results_main_sa1 <- bind_rows(
+  extract_or(model1_sa1, "Model 1", exposure_var_sa1),
+  extract_or(model2_sa1, "Model 2", exposure_var_sa1),
+  extract_or(model3_sa1, "Model 3", exposure_var_sa1),
+  extract_or(model4_sa1, "Model 4", exposure_var_sa1)
+)
+
+cat("\nSA1 main results:\n")
+print(results_main_sa1)
+
+# ==============================================================================
+# SA1-9.  Standardised OR
+# ==============================================================================
+
+model_z_sa1  <- fit_model_sa1("CMB_z", model4_covars)
+result_z_sa1 <- extract_or(model_z_sa1, "Per 1-SD", "CMB_z")
+
+cat("\nSA1 standardised OR:\n")
+print(result_z_sa1)
+
+# ==============================================================================
+# SA1-10.  P for trend
+# ==============================================================================
+
+model_trend_sa1 <- fit_model_sa1("CMB_Trend", model4_covars)
+trend_cf_sa1    <- summary(model_trend_sa1)$coefficients
+
+trend_result_sa1 <- data.frame(
+  term    = "CMB_Trend",
+  beta    = trend_cf_sa1["CMB_Trend", "Estimate"],
+  se      = trend_cf_sa1["CMB_Trend", "Std. Error"],
+  OR      = exp(trend_cf_sa1["CMB_Trend", "Estimate"]),
+  lower95 = exp(trend_cf_sa1["CMB_Trend", "Estimate"] -
+                  1.96 * trend_cf_sa1["CMB_Trend", "Std. Error"]),
+  upper95 = exp(trend_cf_sa1["CMB_Trend", "Estimate"] +
+                  1.96 * trend_cf_sa1["CMB_Trend", "Std. Error"]),
+  p_value = trend_cf_sa1["CMB_Trend", "Pr(>|t|)"],
+  p_fmt   = format_p(trend_cf_sa1["CMB_Trend", "Pr(>|t|)"])
+)
+
+cat("\nSA1 trend result:\n")
+print(trend_result_sa1)
+
+# ==============================================================================
+# SA1-11.  Publication tables
+# ==============================================================================
+
+table_main_sa1 <- results_main_sa1 %>%
+  mutate(
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)), " (",
+      sprintf("%.3f", round(lower95, 3)), "-",
+      sprintf("%.3f", round(upper95, 3)), ")"
+    )
+  ) %>%
+  dplyr::select(Model, OR, lower95, upper95, OR_95CI, p_fmt)
+
+table_z_sa1 <- result_z_sa1 %>%
+  mutate(
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)), " (",
+      sprintf("%.3f", round(lower95, 3)), "-",
+      sprintf("%.3f", round(upper95, 3)), ")"
+    )
+  ) %>%
+  dplyr::select(Model, OR, lower95, upper95, OR_95CI, p_fmt)
+
+table_trend_sa1 <- trend_result_sa1 %>%
+  transmute(
+    Model   = "P for trend",
+    OR      = OR,
+    lower95 = lower95,
+    upper95 = upper95,
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)), " (",
+      sprintf("%.3f", round(lower95, 3)), "-",
+      sprintf("%.3f", round(upper95, 3)), ")"
+    ),
+    p_fmt   = p_fmt
+  )
+
+table_final_sa1 <- bind_rows(table_main_sa1, table_z_sa1, table_trend_sa1)
+
+write.csv(table_main_sa1,
+          file.path(out_dir_sa1, "SA1_PHQ9_ge15_main_results.csv"),
+          row.names = FALSE)
+write.csv(table_z_sa1,
+          file.path(out_dir_sa1, "SA1_PHQ9_ge15_standardized_OR.csv"),
+          row.names = FALSE)
+write.csv(table_trend_sa1,
+          file.path(out_dir_sa1, "SA1_PHQ9_ge15_trend_result.csv"),
+          row.names = FALSE)
+write.csv(table_final_sa1,
+          file.path(out_dir_sa1, "SA1_PHQ9_ge15_publication_ready_table.csv"),
+          row.names = FALSE)
+
+# ==============================================================================
+# SA1-12.  Forest plot
+# ==============================================================================
+
+plot_data_sa1 <- bind_rows(
+  results_main_sa1 %>%
+    transmute(Model = Model, OR = OR, LCI = lower95, UCI = upper95, Type = Model),
+  result_z_sa1 %>%
+    transmute(Model = "Per 1-SD", OR = OR, LCI = lower95, UCI = upper95,
+              Type = "Per 1-SD")
+)
+
+plot_data_sa1$Model <- factor(
+  plot_data_sa1$Model,
+  levels = rev(c("Model 1", "Model 2", "Model 3", "Model 4", "Per 1-SD"))
+)
+
+model_colors <- c(
+  "Model 1"  = "#0072B2",
+  "Model 2"  = "#56B4E9",
+  "Model 3"  = "#E69F00",
+  "Model 4"  = "#D55E00",
+  "Per 1-SD" = "#009E73"
+)
+
+x_min_sa1 <- min(0.95, floor(min(plot_data_sa1$LCI, na.rm = TRUE) * 20) / 20)
+x_max_sa1 <- ceiling(max(plot_data_sa1$UCI, na.rm = TRUE) * 20) / 20
+
+forest_plot_sa1 <- ggplot(
+  plot_data_sa1,
+  aes(x = OR, y = Model, color = Type)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed",
+             linewidth = 0.45, color = "grey40") +
+  geom_errorbarh(aes(xmin = LCI, xmax = UCI),
+                 height = 0.18, linewidth = 0.8) +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = model_colors, guide = "none") +
+  scale_x_continuous(
+    limits = c(x_min_sa1, x_max_sa1),
+    breaks = pretty(c(x_min_sa1, x_max_sa1), n = 5)
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title      = element_blank(),
+    axis.text.x     = element_text(size = 10,   color = "black"),
+    axis.text.y     = element_text(size = 10.5, color = "black"),
+    axis.line       = element_line(color = "black", linewidth = 0.45),
+    axis.ticks      = element_line(color = "black", linewidth = 0.35),
+    panel.grid      = element_blank(),
+    legend.position = "none",
+    plot.margin     = margin(6, 8, 6, 6)
+  )
+
+ggsave(
+  filename    = file.path(fig_dir_sa1, "SA1_PHQ9_ge15_forest_plot.tiff"),
+  plot        = forest_plot_sa1,
+  width = 4.8, height = 3.4, units = "in",
+  dpi = 600, compression = "lzw", bg = "white"
+)
+ggsave(
+  filename = file.path(fig_dir_sa1, "SA1_PHQ9_ge15_forest_plot.pdf"),
+  plot     = forest_plot_sa1,
+  width = 4.8, height = 3.4, units = "in", device = cairo_pdf
+)
+ggsave(
+  filename = file.path(fig_dir_sa1, "SA1_PHQ9_ge15_forest_plot.png"),
+  plot     = forest_plot_sa1,
+  width = 4.8, height = 3.4, units = "in", dpi = 300, bg = "white"
+)
+
+print(forest_plot_sa1)
+
+# ==============================================================================
+# SA1-13.  QC summary
+# ==============================================================================
+
+qc_sa1 <- data.frame(
+  item = c(
+    "input_dataset", "outcome_variable",
+    "original_n", "analysis_n", "removed_n",
+    "CMB_min", "CMB_max", "CMB_mean",
+    "quartile_cutpoints", "quartile_distribution",
+    "model4_OR", "model4_95CI", "model4_P",
+    "standardized_OR", "standardized_95CI", "standardized_P",
+    "trend_OR", "trend_95CI", "trend_P",
+    "table_final", "forest_plot_tiff"
+  ),
+  value = c(
+    data_path, outcome_var_sa1,
+    nrow(dat_full), nrow(dat_sa1), nrow(dat_full) - nrow(dat_sa1),
+    min(dat_sa1[[exposure_var_sa1]], na.rm = TRUE),
+    max(dat_sa1[[exposure_var_sa1]], na.rm = TRUE),
+    round(mean(dat_sa1[[exposure_var_sa1]], na.rm = TRUE), 3),
+    paste(q_values_sa1, collapse = ", "),
+    paste(names(table(dat_sa1$CMB_Q)), as.numeric(table(dat_sa1$CMB_Q)),
+          sep = ":", collapse = "; "),
+    round(results_main_sa1$OR[results_main_sa1$Model == "Model 4"], 3),
+    paste0(round(results_main_sa1$lower95[results_main_sa1$Model == "Model 4"], 3),
+           "-",
+           round(results_main_sa1$upper95[results_main_sa1$Model == "Model 4"], 3)),
+    results_main_sa1$p_fmt[results_main_sa1$Model == "Model 4"],
+    round(result_z_sa1$OR, 3),
+    paste0(round(result_z_sa1$lower95, 3), "-", round(result_z_sa1$upper95, 3)),
+    result_z_sa1$p_fmt,
+    round(trend_result_sa1$OR, 3),
+    paste0(round(trend_result_sa1$lower95, 3), "-",
+           round(trend_result_sa1$upper95, 3)),
+    trend_result_sa1$p_fmt,
+    file.path(out_dir_sa1, "SA1_PHQ9_ge15_publication_ready_table.csv"),
+    file.path(fig_dir_sa1, "SA1_PHQ9_ge15_forest_plot.tiff")
+  )
+)
+
+write.csv(qc_sa1,
+          file.path(out_dir_sa1, "SA1_PHQ9_ge15_QC_summary.csv"),
+          row.names = FALSE)
+
+cat("\n============================================================\n")
+cat("SA1 PHQ-9 >= 15 COMPLETE\n")
+cat("============================================================\n")
+cat("Original N:", nrow(dat_full), "\n")
+cat("Analysis N:", nrow(dat_sa1),  "\n")
+cat("Removed N :", nrow(dat_full) - nrow(dat_sa1), "\n")
+cat("Output dir:", out_dir_sa1, "\n")
+cat("============================================================\n")
+
+
+################################################################################
+# ============================================================
+# SA2 — Modified PHQ-9 (no sleep item DPQ030) >= 10
+#        Excluding daily suicidal ideation (DPQ090 == 3)
+# ============================================================
+################################################################################
+
+# ==============================================================================
+# SA2-0.  Paths
+# ==============================================================================
+
+out_dir_sa2 <- file.path(root_dir, "Step19_Sensitivity_PHQ9_Variants",
+                         "SA2_PHQ9_noSleep_ge10")
+fig_dir_sa2 <- file.path(out_dir_sa2, "figures")
+dir.create(out_dir_sa2, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir_sa2, recursive = TRUE, showWarnings = FALSE)
+
+# ==============================================================================
+# SA2-1.  Outcome variable
+# ==============================================================================
+
+outcome_var_sa2  <- "PHQ9_no_sleep_depression_above_10"
+exposure_var_sa2 <- "CMB_Score_MI_main_rules"
+
+# ==============================================================================
+# SA2-2.  Exclude daily suicidal ideation; build analysis dataset
+# ==============================================================================
+
+dat_sa2 <- dat_full
+dat_sa2[[outcome_var_sa2]] <- ifelse(
+  !is.na(dat_sa2$suicidal_ideation_daily) & dat_sa2$suicidal_ideation_daily == 1,
+  NA_real_,
+  dat_sa2[[outcome_var_sa2]]
+)
+
+required_vars_sa2 <- unique(c(
+  "SEQN", "SDMVPSU", "SDMVSTRA", "mec_adj",
+  outcome_var_sa2, exposure_var_sa2, model4_covars
+))
+
+missing_vars_sa2 <- setdiff(required_vars_sa2, names(dat_sa2))
+if (length(missing_vars_sa2) > 0) {
+  stop("SA2 — missing variables: ", paste(missing_vars_sa2, collapse = ", "))
+}
+
+# ==============================================================================
+# SA2-3.  Missingness audit
+# ==============================================================================
+
+missing_audit_sa2 <- data.frame(
+  variable    = required_vars_sa2,
+  n_missing   = sapply(required_vars_sa2, function(v) sum(is.na(dat_sa2[[v]]))),
+  missing_pct = sapply(
+    required_vars_sa2,
+    function(v) mean(is.na(dat_sa2[[v]])) * 100
+  )
+)
+
+write.csv(
+  missing_audit_sa2,
+  file.path(out_dir_sa2, "SA2_PHQ9_noSleep_ge10_missingness_audit.csv"),
+  row.names = FALSE
+)
+
+cat("\nSA2 missingness audit:\n")
+print(missing_audit_sa2)
+
+# ==============================================================================
+# SA2-4.  Factor handling and analysis dataset
+# ==============================================================================
+
+dat_sa2 <- dat_sa2 %>%
+  dplyr::select(all_of(required_vars_sa2)) %>%
+  dplyr::filter(
+    !is.na(.data[[outcome_var_sa2]]),
+    !is.na(.data[[exposure_var_sa2]]),
+    !is.na(SDMVPSU),
+    !is.na(SDMVSTRA),
+    !is.na(mec_adj),
+    mec_adj  > 0,
+    SDMVPSU  > 0,
+    SDMVSTRA > 0
+  ) %>%
+  mutate(
+    CMB_z = as.numeric(scale(.data[[exposure_var_sa2]]))
+  )
+
+cat("\nSA2 analysis N:", nrow(dat_sa2), "\n")
+cat("SA2 removed N :", nrow(dat_full) - nrow(dat_sa2), "\n")
+
+cat("\nSA2 outcome distribution:\n")
+print(table(dat_sa2[[outcome_var_sa2]], useNA = "ifany"))
+
+cat("\nSA2 CMB distribution:\n")
+print(summary(dat_sa2[[exposure_var_sa2]]))
+
+# ==============================================================================
+# SA2-5.  Survey design
+# ==============================================================================
+
+design_sa2 <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data    = dat_sa2,
+  nest    = TRUE
+)
+
+# ==============================================================================
+# SA2-6.  Correct weighted quartiles
+# ==============================================================================
+
+q_cut_sa2 <- svyquantile(
+  as.formula(paste0("~", exposure_var_sa2)),
+  design    = design_sa2,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm     = TRUE,
+  ci        = FALSE
+)
+
+q_values_sa2 <- sort(unique(as.numeric(coef(q_cut_sa2))))
+
+if (length(q_values_sa2) < 3) {
+  stop("SA2 — weighted quartile cut points are not sufficiently unique.")
+}
+
+dat_sa2 <- dat_sa2 %>%
+  mutate(
+    CMB_Q = cut(
+      .data[[exposure_var_sa2]],
+      breaks         = q_values_sa2,
+      include.lowest = TRUE,
+      labels         = FALSE
+    ),
+    CMB_Trend = as.numeric(CMB_Q)
+  )
+
+if (any(is.na(dat_sa2$CMB_Q))) {
+  stop("SA2 — CMB_Q contains NA after weighted quartile construction.")
+}
+
+design_sa2 <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data    = dat_sa2,
+  nest    = TRUE
+)
+
+cat("\nSA2 weighted quartile cutpoints:\n")
+print(q_values_sa2)
+
+cat("\nSA2 CMB quartile distribution:\n")
+print(table(dat_sa2$CMB_Q, useNA = "ifany"))
+
+# ==============================================================================
+# SA2-7.  Helper functions
+# ==============================================================================
+
+make_formula_sa2 <- function(exposure, covars = NULL) {
+  rhs <- c(exposure, covars)
+  as.formula(paste(outcome_var_sa2, "~", paste(rhs, collapse = " + ")))
+}
+
+fit_model_sa2 <- function(exposure, covars = NULL) {
+  svyglm(
+    formula = make_formula_sa2(exposure, covars),
+    design  = design_sa2,
+    family  = quasibinomial()
+  )
+}
+
+# ==============================================================================
+# SA2-8.  Four models
+# ==============================================================================
+
+model1_sa2 <- fit_model_sa2(exposure_var_sa2, NULL)
+model2_sa2 <- fit_model_sa2(exposure_var_sa2, model2_covars)
+model3_sa2 <- fit_model_sa2(exposure_var_sa2, model3_covars)
+model4_sa2 <- fit_model_sa2(exposure_var_sa2, model4_covars)
+
+results_main_sa2 <- bind_rows(
+  extract_or(model1_sa2, "Model 1", exposure_var_sa2),
+  extract_or(model2_sa2, "Model 2", exposure_var_sa2),
+  extract_or(model3_sa2, "Model 3", exposure_var_sa2),
+  extract_or(model4_sa2, "Model 4", exposure_var_sa2)
+)
+
+cat("\nSA2 main results:\n")
+print(results_main_sa2)
+
+# ==============================================================================
+# SA2-9.  Standardised OR
+# ==============================================================================
+
+model_z_sa2  <- fit_model_sa2("CMB_z", model4_covars)
+result_z_sa2 <- extract_or(model_z_sa2, "Per 1-SD", "CMB_z")
+
+cat("\nSA2 standardised OR:\n")
+print(result_z_sa2)
+
+# ==============================================================================
+# SA2-10.  P for trend
+# ==============================================================================
+
+model_trend_sa2 <- fit_model_sa2("CMB_Trend", model4_covars)
+trend_cf_sa2    <- summary(model_trend_sa2)$coefficients
+
+trend_result_sa2 <- data.frame(
+  term    = "CMB_Trend",
+  beta    = trend_cf_sa2["CMB_Trend", "Estimate"],
+  se      = trend_cf_sa2["CMB_Trend", "Std. Error"],
+  OR      = exp(trend_cf_sa2["CMB_Trend", "Estimate"]),
+  lower95 = exp(trend_cf_sa2["CMB_Trend", "Estimate"] -
+                  1.96 * trend_cf_sa2["CMB_Trend", "Std. Error"]),
+  upper95 = exp(trend_cf_sa2["CMB_Trend", "Estimate"] +
+                  1.96 * trend_cf_sa2["CMB_Trend", "Std. Error"]),
+  p_value = trend_cf_sa2["CMB_Trend", "Pr(>|t|)"],
+  p_fmt   = format_p(trend_cf_sa2["CMB_Trend", "Pr(>|t|)"])
+)
+
+cat("\nSA2 trend result:\n")
+print(trend_result_sa2)
+
+# ==============================================================================
+# SA2-11.  Publication tables
+# ==============================================================================
+
+table_main_sa2 <- results_main_sa2 %>%
+  mutate(
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)), " (",
+      sprintf("%.3f", round(lower95, 3)), "-",
+      sprintf("%.3f", round(upper95, 3)), ")"
+    )
+  ) %>%
+  dplyr::select(Model, OR, lower95, upper95, OR_95CI, p_fmt)
+
+table_z_sa2 <- result_z_sa2 %>%
+  mutate(
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)), " (",
+      sprintf("%.3f", round(lower95, 3)), "-",
+      sprintf("%.3f", round(upper95, 3)), ")"
+    )
+  ) %>%
+  dplyr::select(Model, OR, lower95, upper95, OR_95CI, p_fmt)
+
+table_trend_sa2 <- trend_result_sa2 %>%
+  transmute(
+    Model   = "P for trend",
+    OR      = OR,
+    lower95 = lower95,
+    upper95 = upper95,
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)), " (",
+      sprintf("%.3f", round(lower95, 3)), "-",
+      sprintf("%.3f", round(upper95, 3)), ")"
+    ),
+    p_fmt   = p_fmt
+  )
+
+table_final_sa2 <- bind_rows(table_main_sa2, table_z_sa2, table_trend_sa2)
+
+write.csv(table_main_sa2,
+          file.path(out_dir_sa2, "SA2_PHQ9_noSleep_ge10_main_results.csv"),
+          row.names = FALSE)
+write.csv(table_z_sa2,
+          file.path(out_dir_sa2, "SA2_PHQ9_noSleep_ge10_standardized_OR.csv"),
+          row.names = FALSE)
+write.csv(table_trend_sa2,
+          file.path(out_dir_sa2, "SA2_PHQ9_noSleep_ge10_trend_result.csv"),
+          row.names = FALSE)
+write.csv(table_final_sa2,
+          file.path(out_dir_sa2,
+                    "SA2_PHQ9_noSleep_ge10_publication_ready_table.csv"),
+          row.names = FALSE)
+
+# ==============================================================================
+# SA2-12.  Forest plot
+# ==============================================================================
+
+plot_data_sa2 <- bind_rows(
+  results_main_sa2 %>%
+    transmute(Model = Model, OR = OR, LCI = lower95, UCI = upper95, Type = Model),
+  result_z_sa2 %>%
+    transmute(Model = "Per 1-SD", OR = OR, LCI = lower95, UCI = upper95,
+              Type = "Per 1-SD")
+)
+
+plot_data_sa2$Model <- factor(
+  plot_data_sa2$Model,
+  levels = rev(c("Model 1", "Model 2", "Model 3", "Model 4", "Per 1-SD"))
+)
+
+x_min_sa2 <- min(0.95, floor(min(plot_data_sa2$LCI, na.rm = TRUE) * 20) / 20)
+x_max_sa2 <- ceiling(max(plot_data_sa2$UCI, na.rm = TRUE) * 20) / 20
+
+forest_plot_sa2 <- ggplot(
+  plot_data_sa2,
+  aes(x = OR, y = Model, color = Type)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed",
+             linewidth = 0.45, color = "grey40") +
+  geom_errorbarh(aes(xmin = LCI, xmax = UCI),
+                 height = 0.18, linewidth = 0.8) +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = model_colors, guide = "none") +
+  scale_x_continuous(
+    limits = c(x_min_sa2, x_max_sa2),
+    breaks = pretty(c(x_min_sa2, x_max_sa2), n = 5)
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title      = element_blank(),
+    axis.text.x     = element_text(size = 10,   color = "black"),
+    axis.text.y     = element_text(size = 10.5, color = "black"),
+    axis.line       = element_line(color = "black", linewidth = 0.45),
+    axis.ticks      = element_line(color = "black", linewidth = 0.35),
+    panel.grid      = element_blank(),
+    legend.position = "none",
+    plot.margin     = margin(6, 8, 6, 6)
+  )
+
+ggsave(
+  filename    = file.path(fig_dir_sa2, "SA2_PHQ9_noSleep_ge10_forest_plot.tiff"),
+  plot        = forest_plot_sa2,
+  width = 4.8, height = 3.4, units = "in",
+  dpi = 600, compression = "lzw", bg = "white"
+)
+ggsave(
+  filename = file.path(fig_dir_sa2, "SA2_PHQ9_noSleep_ge10_forest_plot.pdf"),
+  plot     = forest_plot_sa2,
+  width = 4.8, height = 3.4, units = "in", device = cairo_pdf
+)
+ggsave(
+  filename = file.path(fig_dir_sa2, "SA2_PHQ9_noSleep_ge10_forest_plot.png"),
+  plot     = forest_plot_sa2,
+  width = 4.8, height = 3.4, units = "in", dpi = 300, bg = "white"
+)
+
+print(forest_plot_sa2)
+
+# ==============================================================================
+# SA2-13.  QC summary
+# ==============================================================================
+
+qc_sa2 <- data.frame(
+  item = c(
+    "input_dataset", "outcome_variable",
+    "original_n", "analysis_n", "removed_n",
+    "CMB_min", "CMB_max", "CMB_mean",
+    "quartile_cutpoints", "quartile_distribution",
+    "model4_OR", "model4_95CI", "model4_P",
+    "standardized_OR", "standardized_95CI", "standardized_P",
+    "trend_OR", "trend_95CI", "trend_P",
+    "table_final", "forest_plot_tiff"
+  ),
+  value = c(
+    data_path, outcome_var_sa2,
+    nrow(dat_full), nrow(dat_sa2), nrow(dat_full) - nrow(dat_sa2),
+    min(dat_sa2[[exposure_var_sa2]], na.rm = TRUE),
+    max(dat_sa2[[exposure_var_sa2]], na.rm = TRUE),
+    round(mean(dat_sa2[[exposure_var_sa2]], na.rm = TRUE), 3),
+    paste(q_values_sa2, collapse = ", "),
+    paste(names(table(dat_sa2$CMB_Q)), as.numeric(table(dat_sa2$CMB_Q)),
+          sep = ":", collapse = "; "),
+    round(results_main_sa2$OR[results_main_sa2$Model == "Model 4"], 3),
+    paste0(round(results_main_sa2$lower95[results_main_sa2$Model == "Model 4"], 3),
+           "-",
+           round(results_main_sa2$upper95[results_main_sa2$Model == "Model 4"], 3)),
+    results_main_sa2$p_fmt[results_main_sa2$Model == "Model 4"],
+    round(result_z_sa2$OR, 3),
+    paste0(round(result_z_sa2$lower95, 3), "-", round(result_z_sa2$upper95, 3)),
+    result_z_sa2$p_fmt,
+    round(trend_result_sa2$OR, 3),
+    paste0(round(trend_result_sa2$lower95, 3), "-",
+           round(trend_result_sa2$upper95, 3)),
+    trend_result_sa2$p_fmt,
+    file.path(out_dir_sa2,
+              "SA2_PHQ9_noSleep_ge10_publication_ready_table.csv"),
+    file.path(fig_dir_sa2, "SA2_PHQ9_noSleep_ge10_forest_plot.tiff")
+  )
+)
+
+write.csv(qc_sa2,
+          file.path(out_dir_sa2, "SA2_PHQ9_noSleep_ge10_QC_summary.csv"),
+          row.names = FALSE)
+
+cat("\n============================================================\n")
+cat("SA2 Modified PHQ-9 (no sleep item) >= 10 COMPLETE\n")
+cat("============================================================\n")
+cat("Original N:", nrow(dat_full), "\n")
+cat("Analysis N:", nrow(dat_sa2),  "\n")
+cat("Removed N :", nrow(dat_full) - nrow(dat_sa2), "\n")
+cat("Output dir:", out_dir_sa2, "\n")
+cat("============================================================\n")
+
+
+################################################################################
+# ============================================================
+# SA3 — Modified PHQ-9 (no sleep item DPQ030) >= 9
+#        Excluding daily suicidal ideation (DPQ090 == 3)
+# ============================================================
+################################################################################
+
+# ==============================================================================
+# SA3-0.  Paths
+# ==============================================================================
+
+out_dir_sa3 <- file.path(root_dir, "Step19_Sensitivity_PHQ9_Variants",
+                         "SA3_PHQ9_noSleep_ge9")
+fig_dir_sa3 <- file.path(out_dir_sa3, "figures")
+dir.create(out_dir_sa3, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir_sa3, recursive = TRUE, showWarnings = FALSE)
+
+# ==============================================================================
+# SA3-1.  Outcome variable
+# ==============================================================================
+
+outcome_var_sa3  <- "PHQ9_no_sleep_depression_above_9"
+exposure_var_sa3 <- "CMB_Score_MI_main_rules"
+
+# ==============================================================================
+# SA3-2.  Exclude daily suicidal ideation; build analysis dataset
+# ==============================================================================
+
+dat_sa3 <- dat_full
+dat_sa3[[outcome_var_sa3]] <- ifelse(
+  !is.na(dat_sa3$suicidal_ideation_daily) & dat_sa3$suicidal_ideation_daily == 1,
+  NA_real_,
+  dat_sa3[[outcome_var_sa3]]
+)
+
+required_vars_sa3 <- unique(c(
+  "SEQN", "SDMVPSU", "SDMVSTRA", "mec_adj",
+  outcome_var_sa3, exposure_var_sa3, model4_covars
+))
+
+missing_vars_sa3 <- setdiff(required_vars_sa3, names(dat_sa3))
+if (length(missing_vars_sa3) > 0) {
+  stop("SA3 — missing variables: ", paste(missing_vars_sa3, collapse = ", "))
+}
+
+# ==============================================================================
+# SA3-3.  Missingness audit
+# ==============================================================================
+
+missing_audit_sa3 <- data.frame(
+  variable    = required_vars_sa3,
+  n_missing   = sapply(required_vars_sa3, function(v) sum(is.na(dat_sa3[[v]]))),
+  missing_pct = sapply(
+    required_vars_sa3,
+    function(v) mean(is.na(dat_sa3[[v]])) * 100
+  )
+)
+
+write.csv(
+  missing_audit_sa3,
+  file.path(out_dir_sa3, "SA3_PHQ9_noSleep_ge9_missingness_audit.csv"),
+  row.names = FALSE
+)
+
+cat("\nSA3 missingness audit:\n")
+print(missing_audit_sa3)
+
+# ==============================================================================
+# SA3-4.  Factor handling and analysis dataset
+# ==============================================================================
+
+dat_sa3 <- dat_sa3 %>%
+  dplyr::select(all_of(required_vars_sa3)) %>%
+  dplyr::filter(
+    !is.na(.data[[outcome_var_sa3]]),
+    !is.na(.data[[exposure_var_sa3]]),
+    !is.na(SDMVPSU),
+    !is.na(SDMVSTRA),
+    !is.na(mec_adj),
+    mec_adj  > 0,
+    SDMVPSU  > 0,
+    SDMVSTRA > 0
+  ) %>%
+  mutate(
+    CMB_z = as.numeric(scale(.data[[exposure_var_sa3]]))
+  )
+
+cat("\nSA3 analysis N:", nrow(dat_sa3), "\n")
+cat("SA3 removed N :", nrow(dat_full) - nrow(dat_sa3), "\n")
+
+cat("\nSA3 outcome distribution:\n")
+print(table(dat_sa3[[outcome_var_sa3]], useNA = "ifany"))
+
+cat("\nSA3 CMB distribution:\n")
+print(summary(dat_sa3[[exposure_var_sa3]]))
+
+# ==============================================================================
+# SA3-5.  Survey design
+# ==============================================================================
+
+design_sa3 <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data    = dat_sa3,
+  nest    = TRUE
+)
+
+# ==============================================================================
+# SA3-6.  Correct weighted quartiles
+# ==============================================================================
+
+q_cut_sa3 <- svyquantile(
+  as.formula(paste0("~", exposure_var_sa3)),
+  design    = design_sa3,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm     = TRUE,
+  ci        = FALSE
+)
+
+q_values_sa3 <- sort(unique(as.numeric(coef(q_cut_sa3))))
+
+if (length(q_values_sa3) < 3) {
+  stop("SA3 — weighted quartile cut points are not sufficiently unique.")
+}
+
+dat_sa3 <- dat_sa3 %>%
+  mutate(
+    CMB_Q = cut(
+      .data[[exposure_var_sa3]],
+      breaks         = q_values_sa3,
+      include.lowest = TRUE,
+      labels         = FALSE
+    ),
+    CMB_Trend = as.numeric(CMB_Q)
+  )
+
+if (any(is.na(dat_sa3$CMB_Q))) {
+  stop("SA3 — CMB_Q contains NA after weighted quartile construction.")
+}
+
+design_sa3 <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data    = dat_sa3,
+  nest    = TRUE
+)
+
+cat("\nSA3 weighted quartile cutpoints:\n")
+print(q_values_sa3)
+
+cat("\nSA3 CMB quartile distribution:\n")
+print(table(dat_sa3$CMB_Q, useNA = "ifany"))
+
+# ==============================================================================
+# SA3-7.  Helper functions
+# ==============================================================================
+
+make_formula_sa3 <- function(exposure, covars = NULL) {
+  rhs <- c(exposure, covars)
+  as.formula(paste(outcome_var_sa3, "~", paste(rhs, collapse = " + ")))
+}
+
+fit_model_sa3 <- function(exposure, covars = NULL) {
+  svyglm(
+    formula = make_formula_sa3(exposure, covars),
+    design  = design_sa3,
+    family  = quasibinomial()
+  )
+}
+
+# ==============================================================================
+# SA3-8.  Four models
+# ==============================================================================
+
+model1_sa3 <- fit_model_sa3(exposure_var_sa3, NULL)
+model2_sa3 <- fit_model_sa3(exposure_var_sa3, model2_covars)
+model3_sa3 <- fit_model_sa3(exposure_var_sa3, model3_covars)
+model4_sa3 <- fit_model_sa3(exposure_var_sa3, model4_covars)
+
+results_main_sa3 <- bind_rows(
+  extract_or(model1_sa3, "Model 1", exposure_var_sa3),
+  extract_or(model2_sa3, "Model 2", exposure_var_sa3),
+  extract_or(model3_sa3, "Model 3", exposure_var_sa3),
+  extract_or(model4_sa3, "Model 4", exposure_var_sa3)
+)
+
+cat("\nSA3 main results:\n")
+print(results_main_sa3)
+
+# ==============================================================================
+# SA3-9.  Standardised OR
+# ==============================================================================
+
+model_z_sa3  <- fit_model_sa3("CMB_z", model4_covars)
+result_z_sa3 <- extract_or(model_z_sa3, "Per 1-SD", "CMB_z")
+
+cat("\nSA3 standardised OR:\n")
+print(result_z_sa3)
+
+# ==============================================================================
+# SA3-10.  P for trend
+# ==============================================================================
+
+model_trend_sa3 <- fit_model_sa3("CMB_Trend", model4_covars)
+trend_cf_sa3    <- summary(model_trend_sa3)$coefficients
+
+trend_result_sa3 <- data.frame(
+  term    = "CMB_Trend",
+  beta    = trend_cf_sa3["CMB_Trend", "Estimate"],
+  se      = trend_cf_sa3["CMB_Trend", "Std. Error"],
+  OR      = exp(trend_cf_sa3["CMB_Trend", "Estimate"]),
+  lower95 = exp(trend_cf_sa3["CMB_Trend", "Estimate"] -
+                  1.96 * trend_cf_sa3["CMB_Trend", "Std. Error"]),
+  upper95 = exp(trend_cf_sa3["CMB_Trend", "Estimate"] +
+                  1.96 * trend_cf_sa3["CMB_Trend", "Std. Error"]),
+  p_value = trend_cf_sa3["CMB_Trend", "Pr(>|t|)"],
+  p_fmt   = format_p(trend_cf_sa3["CMB_Trend", "Pr(>|t|)"])
+)
+
+cat("\nSA3 trend result:\n")
+print(trend_result_sa3)
+
+# ==============================================================================
+# SA3-11.  Publication tables
+# ==============================================================================
+
+table_main_sa3 <- results_main_sa3 %>%
+  mutate(
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)), " (",
+      sprintf("%.3f", round(lower95, 3)), "-",
+      sprintf("%.3f", round(upper95, 3)), ")"
+    )
+  ) %>%
+  dplyr::select(Model, OR, lower95, upper95, OR_95CI, p_fmt)
+
+table_z_sa3 <- result_z_sa3 %>%
+  mutate(
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)), " (",
+      sprintf("%.3f", round(lower95, 3)), "-",
+      sprintf("%.3f", round(upper95, 3)), ")"
+    )
+  ) %>%
+  dplyr::select(Model, OR, lower95, upper95, OR_95CI, p_fmt)
+
+table_trend_sa3 <- trend_result_sa3 %>%
+  transmute(
+    Model   = "P for trend",
+    OR      = OR,
+    lower95 = lower95,
+    upper95 = upper95,
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)), " (",
+      sprintf("%.3f", round(lower95, 3)), "-",
+      sprintf("%.3f", round(upper95, 3)), ")"
+    ),
+    p_fmt   = p_fmt
+  )
+
+table_final_sa3 <- bind_rows(table_main_sa3, table_z_sa3, table_trend_sa3)
+
+write.csv(table_main_sa3,
+          file.path(out_dir_sa3, "SA3_PHQ9_noSleep_ge9_main_results.csv"),
+          row.names = FALSE)
+write.csv(table_z_sa3,
+          file.path(out_dir_sa3, "SA3_PHQ9_noSleep_ge9_standardized_OR.csv"),
+          row.names = FALSE)
+write.csv(table_trend_sa3,
+          file.path(out_dir_sa3, "SA3_PHQ9_noSleep_ge9_trend_result.csv"),
+          row.names = FALSE)
+write.csv(table_final_sa3,
+          file.path(out_dir_sa3,
+                    "SA3_PHQ9_noSleep_ge9_publication_ready_table.csv"),
+          row.names = FALSE)
+
+# ==============================================================================
+# SA3-12.  Forest plot
+# ==============================================================================
+
+plot_data_sa3 <- bind_rows(
+  results_main_sa3 %>%
+    transmute(Model = Model, OR = OR, LCI = lower95, UCI = upper95, Type = Model),
+  result_z_sa3 %>%
+    transmute(Model = "Per 1-SD", OR = OR, LCI = lower95, UCI = upper95,
+              Type = "Per 1-SD")
+)
+
+plot_data_sa3$Model <- factor(
+  plot_data_sa3$Model,
+  levels = rev(c("Model 1", "Model 2", "Model 3", "Model 4", "Per 1-SD"))
+)
+
+x_min_sa3 <- min(0.95, floor(min(plot_data_sa3$LCI, na.rm = TRUE) * 20) / 20)
+x_max_sa3 <- ceiling(max(plot_data_sa3$UCI, na.rm = TRUE) * 20) / 20
+
+forest_plot_sa3 <- ggplot(
+  plot_data_sa3,
+  aes(x = OR, y = Model, color = Type)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed",
+             linewidth = 0.45, color = "grey40") +
+  geom_errorbarh(aes(xmin = LCI, xmax = UCI),
+                 height = 0.18, linewidth = 0.8) +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = model_colors, guide = "none") +
+  scale_x_continuous(
+    limits = c(x_min_sa3, x_max_sa3),
+    breaks = pretty(c(x_min_sa3, x_max_sa3), n = 5)
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title      = element_blank(),
+    axis.text.x     = element_text(size = 10,   color = "black"),
+    axis.text.y     = element_text(size = 10.5, color = "black"),
+    axis.line       = element_line(color = "black", linewidth = 0.45),
+    axis.ticks      = element_line(color = "black", linewidth = 0.35),
+    panel.grid      = element_blank(),
+    legend.position = "none",
+    plot.margin     = margin(6, 8, 6, 6)
+  )
+
+ggsave(
+  filename    = file.path(fig_dir_sa3, "SA3_PHQ9_noSleep_ge9_forest_plot.tiff"),
+  plot        = forest_plot_sa3,
+  width = 4.8, height = 3.4, units = "in",
+  dpi = 600, compression = "lzw", bg = "white"
+)
+ggsave(
+  filename = file.path(fig_dir_sa3, "SA3_PHQ9_noSleep_ge9_forest_plot.pdf"),
+  plot     = forest_plot_sa3,
+  width = 4.8, height = 3.4, units = "in", device = cairo_pdf
+)
+ggsave(
+  filename = file.path(fig_dir_sa3, "SA3_PHQ9_noSleep_ge9_forest_plot.png"),
+  plot     = forest_plot_sa3,
+  width = 4.8, height = 3.4, units = "in", dpi = 300, bg = "white"
+)
+
+print(forest_plot_sa3)
+
+# ==============================================================================
+# SA3-13.  QC summary
+# ==============================================================================
+
+qc_sa3 <- data.frame(
+  item = c(
+    "input_dataset", "outcome_variable",
+    "original_n", "analysis_n", "removed_n",
+    "CMB_min", "CMB_max", "CMB_mean",
+    "quartile_cutpoints", "quartile_distribution",
+    "model4_OR", "model4_95CI", "model4_P",
+    "standardized_OR", "standardized_95CI", "standardized_P",
+    "trend_OR", "trend_95CI", "trend_P",
+    "table_final", "forest_plot_tiff"
+  ),
+  value = c(
+    data_path, outcome_var_sa3,
+    nrow(dat_full), nrow(dat_sa3), nrow(dat_full) - nrow(dat_sa3),
+    min(dat_sa3[[exposure_var_sa3]], na.rm = TRUE),
+    max(dat_sa3[[exposure_var_sa3]], na.rm = TRUE),
+    round(mean(dat_sa3[[exposure_var_sa3]], na.rm = TRUE), 3),
+    paste(q_values_sa3, collapse = ", "),
+    paste(names(table(dat_sa3$CMB_Q)), as.numeric(table(dat_sa3$CMB_Q)),
+          sep = ":", collapse = "; "),
+    round(results_main_sa3$OR[results_main_sa3$Model == "Model 4"], 3),
+    paste0(round(results_main_sa3$lower95[results_main_sa3$Model == "Model 4"], 3),
+           "-",
+           round(results_main_sa3$upper95[results_main_sa3$Model == "Model 4"], 3)),
+    results_main_sa3$p_fmt[results_main_sa3$Model == "Model 4"],
+    round(result_z_sa3$OR, 3),
+    paste0(round(result_z_sa3$lower95, 3), "-", round(result_z_sa3$upper95, 3)),
+    result_z_sa3$p_fmt,
+    round(trend_result_sa3$OR, 3),
+    paste0(round(trend_result_sa3$lower95, 3), "-",
+           round(trend_result_sa3$upper95, 3)),
+    trend_result_sa3$p_fmt,
+    file.path(out_dir_sa3,
+              "SA3_PHQ9_noSleep_ge9_publication_ready_table.csv"),
+    file.path(fig_dir_sa3, "SA3_PHQ9_noSleep_ge9_forest_plot.tiff")
+  )
+)
+
+write.csv(qc_sa3,
+          file.path(out_dir_sa3, "SA3_PHQ9_noSleep_ge9_QC_summary.csv"),
+          row.names = FALSE)
+
+cat("\n============================================================\n")
+cat("SA3 Modified PHQ-9 (no sleep item) >= 9 COMPLETE\n")
+cat("============================================================\n")
+cat("Original N:", nrow(dat_full), "\n")
+cat("Analysis N:", nrow(dat_sa3),  "\n")
+cat("Removed N :", nrow(dat_full) - nrow(dat_sa3), "\n")
+cat("Output dir:", out_dir_sa3, "\n")
+cat("============================================================\n")
+
+
+################################################################################
+# FINAL BANNER
+################################################################################
+
+cat("\n============================================================\n")
+cat("ALL THREE SENSITIVITY ANALYSES COMPLETE\n")
+cat("============================================================\n")
+cat("Root output dir:", file.path(root_dir,
+                                  "Step19_Sensitivity_PHQ9_Variants"), "\n")
+cat("  SA1_PHQ9_ge15/\n")
+cat("  SA2_PHQ9_noSleep_ge10/\n")
+cat("  SA3_PHQ9_noSleep_ge9/\n")
+cat("============================================================\n")
