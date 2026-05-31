@@ -1,0 +1,719 @@
+################################################################################
+# STEP 18 revised
+# Six-domain CMB score from complete-case main-analysis scores
+# Clean forest plot + publication table
+################################################################################
+
+rm(list = ls())
+
+library(survey)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+
+options(survey.lonely.psu = "adjust")
+
+root_dir <- "D:/code"
+
+base_path     <- file.path(root_dir, "12.Dataset_CompleteCase.rds")
+midpoint_path <- file.path(root_dir, "15.Sleep_midpoint_scored.rds")
+onset_path    <- file.path(root_dir, "16.Sleep_onset_scored.rds")
+wake_path     <- file.path(root_dir, "17.Sleep_wake_scored.rds")
+
+out_dir <- file.path(root_dir, "Step18_CMB_six_domain_score_revised")
+fig_dir <- file.path(out_dir, "figures")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+needed_files <- c(base_path, midpoint_path, onset_path, wake_path)
+
+if (any(!file.exists(needed_files))) {
+  stop(
+    paste0(
+      "Missing files:\n",
+      paste(needed_files[!file.exists(needed_files)], collapse = "\n")
+    )
+  )
+}
+
+# ==============================================================================
+# 1. Load and merge six score domains
+# ==============================================================================
+
+data_base <- readRDS(base_path) %>%
+  as.data.frame()
+
+score_midpoint <- readRDS(midpoint_path) %>%
+  as.data.frame() %>%
+  dplyr::select(
+    SEQN,
+    weekday_midpoint_score,
+    weekend_midpoint_score
+  )
+
+score_onset <- readRDS(onset_path) %>%
+  as.data.frame() %>%
+  dplyr::select(
+    SEQN,
+    weekday_onset_score,
+    weekend_onset_score
+  )
+
+score_wake <- readRDS(wake_path) %>%
+  as.data.frame() %>%
+  dplyr::select(
+    SEQN,
+    weekday_wake_score,
+    weekend_wake_score
+  )
+
+score_vars <- c(
+  "weekday_midpoint_score",
+  "weekend_midpoint_score",
+  "weekday_onset_score",
+  "weekend_onset_score",
+  "weekday_wake_score",
+  "weekend_wake_score"
+)
+
+nhanes_final <- data_base %>%
+  left_join(score_midpoint, by = "SEQN") %>%
+  left_join(score_onset, by = "SEQN") %>%
+  left_join(score_wake, by = "SEQN") %>%
+  mutate(
+    CMB_Score = rowSums(
+      dplyr::across(all_of(score_vars)),
+      na.rm = FALSE
+    )
+  )
+
+missing_score_vars <- setdiff(score_vars, names(nhanes_final))
+
+if (length(missing_score_vars) > 0) {
+  stop(
+    paste0(
+      "Missing score variables: ",
+      paste(missing_score_vars, collapse = ", ")
+    )
+  )
+}
+
+cat("CMB score distribution:\n")
+print(table(nhanes_final$CMB_Score, useNA = "ifany"))
+
+# ==============================================================================
+# 2. Model variables
+# ==============================================================================
+
+outcome_var <- "Moderate_depression_above"
+
+model2_covars <- c(
+  "RIDAGEYR",
+  "sex",
+  "race_ethnicity"
+)
+
+model3_covars <- c(
+  model2_covars,
+  "education",
+  "marital_status",
+  "smoke_label",
+  "BMI_value",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label",
+  "MET_total",
+  "INDFMPIR"
+)
+
+model4_covars <- c(
+  model3_covars,
+  "sedentary_min"
+)
+
+factor_vars <- c(
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "smoke_label",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label"
+)
+
+required_vars <- unique(c(
+  "SEQN",
+  "SDMVPSU",
+  "SDMVSTRA",
+  "mec_adj",
+  outcome_var,
+  "CMB_Score",
+  score_vars,
+  model4_covars
+))
+
+missing_vars <- setdiff(required_vars, names(nhanes_final))
+
+if (length(missing_vars) > 0) {
+  stop(
+    paste0(
+      "Missing required variables:\n",
+      paste(missing_vars, collapse = ", ")
+    )
+  )
+}
+
+for (v in factor_vars) {
+  nhanes_final[[v]] <- as.factor(nhanes_final[[v]])
+}
+
+nhanes_analysis <- nhanes_final %>%
+  dplyr::select(all_of(required_vars)) %>%
+  dplyr::filter(
+    complete.cases(.),
+    mec_adj > 0,
+    SDMVPSU > 0,
+    SDMVSTRA > 0
+  )
+
+cat("\nAnalysis N:", nrow(nhanes_analysis), "\n")
+cat("CMB score range:",
+    min(nhanes_analysis$CMB_Score, na.rm = TRUE),
+    "-",
+    max(nhanes_analysis$CMB_Score, na.rm = TRUE),
+    "\n")
+
+cat("\nOutcome distribution:\n")
+print(table(nhanes_analysis[[outcome_var]], useNA = "ifany"))
+
+# ==============================================================================
+# 3. Survey design and weighted quartiles
+# ==============================================================================
+
+design_base <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = nhanes_analysis,
+  nest = TRUE
+)
+
+q_cuts <- svyquantile(
+  ~CMB_Score,
+  design = design_base,
+  quantiles = c(0, 0.25, 0.5, 0.75, 1),
+  na.rm = TRUE
+)
+
+q_values <- unique(as.numeric(q_cuts$CMB_Score[, 1]))
+
+if (length(q_values) < 3) {
+  stop("Weighted quartile cut points are not sufficiently unique.")
+}
+
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(
+    CMB_Q = cut(
+      CMB_Score,
+      breaks = q_values,
+      include.lowest = TRUE,
+      labels = FALSE
+    ),
+    CMB_Trend = as.numeric(CMB_Q),
+    CMB_z = as.numeric(scale(CMB_Score))
+  )
+
+design_final <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = nhanes_analysis,
+  nest = TRUE
+)
+
+cat("\nWeighted quartile cut points:\n")
+print(q_values)
+
+cat("\nWeighted-quartile group counts:\n")
+print(table(nhanes_analysis$CMB_Q, useNA = "ifany"))
+
+# ==============================================================================
+# 4. Model helpers
+# ==============================================================================
+
+make_formula <- function(exposure, covars = NULL) {
+  
+  rhs <- c(exposure, covars)
+  
+  as.formula(
+    paste(
+      outcome_var,
+      "~",
+      paste(rhs, collapse = " + ")
+    )
+  )
+}
+
+fit_svy_logistic <- function(exposure, covars = NULL) {
+  
+  svyglm(
+    formula = make_formula(exposure, covars),
+    design = design_final,
+    family = quasibinomial()
+  )
+}
+
+format_p <- function(p) {
+  
+  if (is.na(p)) {
+    return(NA_character_)
+  }
+  
+  if (p < 0.001) {
+    return("<0.001")
+  }
+  
+  sprintf("%.3f", round(p, 3))
+}
+
+extract_or <- function(model, label, var_name = "CMB_Score") {
+  
+  coef_summary <- summary(model)$coefficients
+  
+  if (!var_name %in% rownames(coef_summary)) {
+    stop(
+      paste0(
+        "Target variable not found in model: ",
+        var_name
+      )
+    )
+  }
+  
+  est <- coef_summary[var_name, "Estimate"]
+  se  <- coef_summary[var_name, "Std. Error"]
+  p   <- coef_summary[var_name, "Pr(>|t|)"]
+  
+  data.frame(
+    Model = label,
+    beta = est,
+    se = se,
+    OR = exp(est),
+    lower95 = exp(est - 1.96 * se),
+    upper95 = exp(est + 1.96 * se),
+    p_value = p,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ==============================================================================
+# 5. Four hierarchical models
+# ==============================================================================
+
+model1 <- fit_svy_logistic("CMB_Score", NULL)
+
+model2 <- fit_svy_logistic(
+  "CMB_Score",
+  model2_covars
+)
+
+model3 <- fit_svy_logistic(
+  "CMB_Score",
+  model3_covars
+)
+
+model4 <- fit_svy_logistic(
+  "CMB_Score",
+  model4_covars
+)
+
+results_summary <- bind_rows(
+  extract_or(model1, "Model 1"),
+  extract_or(model2, "Model 2"),
+  extract_or(model3, "Model 3"),
+  extract_or(model4, "Model 4")
+) %>%
+  mutate(
+    OR_round = round(OR, 3),
+    lower95_round = round(lower95, 3),
+    upper95_round = round(upper95, 3),
+    p_fmt = sapply(p_value, format_p)
+  )
+
+cat("\nFour-model CMB score results:\n")
+print(results_summary)
+
+# ==============================================================================
+# 6. Standardized OR and P for trend
+# ==============================================================================
+
+model_z <- fit_svy_logistic(
+  "CMB_z",
+  model4_covars
+)
+
+res_z <- extract_or(
+  model_z,
+  "Per 1-SD increase",
+  var_name = "CMB_z"
+) %>%
+  mutate(
+    OR_round = round(OR, 3),
+    lower95_round = round(lower95, 3),
+    upper95_round = round(upper95, 3),
+    p_fmt = sapply(p_value, format_p)
+  )
+
+model_trend <- fit_svy_logistic(
+  "CMB_Trend",
+  model4_covars
+)
+
+trend_coef <- summary(model_trend)$coefficients
+p_trend <- trend_coef["CMB_Trend", "Pr(>|t|)"]
+
+trend_result <- data.frame(
+  term = "CMB_Trend",
+  beta = trend_coef["CMB_Trend", "Estimate"],
+  se = trend_coef["CMB_Trend", "Std. Error"],
+  OR = exp(trend_coef["CMB_Trend", "Estimate"]),
+  lower95 = exp(
+    trend_coef["CMB_Trend", "Estimate"] -
+      1.96 * trend_coef["CMB_Trend", "Std. Error"]
+  ),
+  upper95 = exp(
+    trend_coef["CMB_Trend", "Estimate"] +
+      1.96 * trend_coef["CMB_Trend", "Std. Error"]
+  ),
+  p_value = p_trend,
+  p_fmt = format_p(p_trend)
+)
+
+# ==============================================================================
+# 7. Export publication tables
+# ==============================================================================
+
+model_table <- bind_rows(
+  results_summary %>%
+    transmute(
+      Analysis = Model,
+      Estimate_type = "Per 1-unit increase",
+      OR = round(OR, 3),
+      Lower_95CI = round(lower95, 3),
+      Upper_95CI = round(upper95, 3),
+      OR_95CI = paste0(
+        sprintf("%.3f", round(OR, 3)),
+        " (",
+        sprintf("%.3f", round(lower95, 3)),
+        "-",
+        sprintf("%.3f", round(upper95, 3)),
+        ")"
+      ),
+      P_value = p_fmt
+    ),
+  res_z %>%
+    transmute(
+      Analysis = "Model 4",
+      Estimate_type = "Per 1-SD increase",
+      OR = round(OR, 3),
+      Lower_95CI = round(lower95, 3),
+      Upper_95CI = round(upper95, 3),
+      OR_95CI = paste0(
+        sprintf("%.3f", round(OR, 3)),
+        " (",
+        sprintf("%.3f", round(lower95, 3)),
+        "-",
+        sprintf("%.3f", round(upper95, 3)),
+        ")"
+      ),
+      P_value = p_fmt
+    )
+)
+
+trend_table <- trend_result %>%
+  transmute(
+    Analysis = "P for trend across weighted quartiles",
+    OR = round(OR, 3),
+    Lower_95CI = round(lower95, 3),
+    Upper_95CI = round(upper95, 3),
+    OR_95CI = paste0(
+      sprintf("%.3f", round(OR, 3)),
+      " (",
+      sprintf("%.3f", round(lower95, 3)),
+      "-",
+      sprintf("%.3f", round(upper95, 3)),
+      ")"
+    ),
+    P_value = p_fmt
+  )
+
+write.csv(
+  model_table,
+  file.path(out_dir, "Step18_CMB_model_results_table.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  trend_table,
+  file.path(out_dir, "Step18_CMB_trend_table.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  bind_rows(
+    model_table %>%
+      mutate(Table = "Model results"),
+    trend_table %>%
+      mutate(
+        Estimate_type = "Weighted quartile trend",
+        Table = "Trend test"
+      ) %>%
+      dplyr::select(
+        Analysis,
+        Estimate_type,
+        OR,
+        Lower_95CI,
+        Upper_95CI,
+        OR_95CI,
+        P_value,
+        Table
+      )
+  ),
+  file.path(out_dir, "Step18_CMB_publication_ready_table.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  nhanes_analysis,
+  file.path(root_dir, "18.Dataset_CMB_six_domain_complete_case.rds")
+)
+
+# ==============================================================================
+# 8. Clean forest plot
+# ==============================================================================
+
+plot_data <- bind_rows(
+  results_summary %>%
+    transmute(
+      Model = Model,
+      OR = OR,
+      LCI = lower95,
+      UCI = upper95,
+      P_val = p_value,
+      Type = Model
+    ),
+  res_z %>%
+    transmute(
+      Model = "Per 1-SD",
+      OR = OR,
+      LCI = lower95,
+      UCI = upper95,
+      P_val = p_value,
+      Type = "Per 1-SD"
+    )
+) %>%
+  mutate(
+    Model = factor(
+      Model,
+      levels = rev(c("Model 1", "Model 2", "Model 3", "Model 4", "Per 1-SD"))
+    ),
+    P_label = sapply(P_val, format_p)
+  )
+
+model_colors <- c(
+  "Model 1" = "#0072B2",
+  "Model 2" = "#56B4E9",
+  "Model 3" = "#E69F00",
+  "Model 4" = "#D55E00",
+  "Per 1-SD" = "#009E73"
+)
+
+x_min <- min(0.95, floor(min(plot_data$LCI, na.rm = TRUE) * 20) / 20)
+x_max <- ceiling(max(plot_data$UCI, na.rm = TRUE) * 20) / 20
+
+forest_plot <- ggplot(
+  plot_data,
+  aes(
+    x = OR,
+    y = Model,
+    color = Type
+  )
+) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    linewidth = 0.45,
+    color = "grey35"
+  ) +
+  geom_errorbarh(
+    aes(
+      xmin = LCI,
+      xmax = UCI
+    ),
+    height = 0.18,
+    linewidth = 0.8
+  ) +
+  geom_point(
+    size = 3.4
+  ) +
+  scale_color_manual(
+    values = model_colors,
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    limits = c(x_min, x_max),
+    breaks = pretty(c(x_min, x_max), n = 5),
+    expand = expansion(mult = c(0.03, 0.08))
+  ) +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme_classic(base_size = 11, base_family = "Arial") +
+  theme(
+    axis.title.x = element_text(
+      size = 11,
+      face = "bold",
+      color = "black",
+      margin = margin(t = 8)
+    ),
+    axis.text.x = element_text(
+      size = 10,
+      color = "black"
+    ),
+    axis.text.y = element_text(
+      size = 10.5,
+      color = "black"
+    ),
+    axis.line = element_line(
+      color = "black",
+      linewidth = 0.45
+    ),
+    axis.ticks = element_line(
+      color = "black",
+      linewidth = 0.35
+    ),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    plot.margin = margin(6, 8, 6, 6)
+  )
+
+ggsave(
+  filename = file.path(fig_dir, "Step18_CMB_clean_forest_plot.tiff"),
+  plot = forest_plot,
+  width = 4.8,
+  height = 3.4,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step18_CMB_clean_forest_plot.png"),
+  plot = forest_plot,
+  width = 4.8,
+  height = 3.4,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step18_CMB_clean_forest_plot.pdf"),
+  plot = forest_plot,
+  width = 4.8,
+  height = 3.4,
+  device = cairo_pdf
+)
+
+print(forest_plot)
+
+# ==============================================================================
+# 9. QC summary
+# ==============================================================================
+
+qc <- data.frame(
+  item = c(
+    "base_file",
+    "midpoint_score_file",
+    "onset_score_file",
+    "wake_score_file",
+    "original_n",
+    "analysis_n",
+    "CMB_score_min",
+    "CMB_score_max",
+    "CMB_score_mean",
+    "weighted_quartile_cuts",
+    "model4_OR",
+    "model4_95CI",
+    "model4_P",
+    "standardized_OR",
+    "standardized_95CI",
+    "standardized_P",
+    "p_for_trend",
+    "output_dataset",
+    "table_model_results",
+    "table_trend_results",
+    "table_publication_ready",
+    "forest_plot_tiff",
+    "forest_plot_png",
+    "forest_plot_pdf"
+  ),
+  value = c(
+    base_path,
+    midpoint_path,
+    onset_path,
+    wake_path,
+    nrow(data_base),
+    nrow(nhanes_analysis),
+    min(nhanes_analysis$CMB_Score, na.rm = TRUE),
+    max(nhanes_analysis$CMB_Score, na.rm = TRUE),
+    round(mean(nhanes_analysis$CMB_Score, na.rm = TRUE), 3),
+    paste(q_values, collapse = ", "),
+    round(results_summary$OR[results_summary$Model == "Model 4"], 3),
+    paste0(
+      round(results_summary$lower95[results_summary$Model == "Model 4"], 3),
+      "-",
+      round(results_summary$upper95[results_summary$Model == "Model 4"], 3)
+    ),
+    results_summary$p_fmt[results_summary$Model == "Model 4"],
+    round(res_z$OR, 3),
+    paste0(
+      round(res_z$lower95, 3),
+      "-",
+      round(res_z$upper95, 3)
+    ),
+    res_z$p_fmt,
+    trend_result$p_fmt,
+    file.path(root_dir, "18.Dataset_CMB_six_domain_complete_case.rds"),
+    file.path(out_dir, "Step18_CMB_model_results_table.csv"),
+    file.path(out_dir, "Step18_CMB_trend_table.csv"),
+    file.path(out_dir, "Step18_CMB_publication_ready_table.csv"),
+    file.path(fig_dir, "Step18_CMB_clean_forest_plot.tiff"),
+    file.path(fig_dir, "Step18_CMB_clean_forest_plot.png"),
+    file.path(fig_dir, "Step18_CMB_clean_forest_plot.pdf")
+  )
+)
+
+write.csv(
+  qc,
+  file.path(out_dir, "Step18_CMB_QC_summary.csv"),
+  row.names = FALSE
+)
+
+cat("\n============================================================\n")
+cat("STEP 18 REVISED COMPLETE\n")
+cat("============================================================\n")
+cat("Analysis N:", nrow(nhanes_analysis), "\n")
+cat("CMB score range:",
+    min(nhanes_analysis$CMB_Score, na.rm = TRUE),
+    "-",
+    max(nhanes_analysis$CMB_Score, na.rm = TRUE),
+    "\n")
+cat("Output dir:", out_dir, "\n")
+cat("Figure dir:", fig_dir, "\n")
+cat("============================================================\n")
