@@ -1,0 +1,318 @@
+################################################################################
+# Script Name: 6. Covariate Processing - Alcohol Consumption
+# Purpose:
+#   Harmonize NHANES alcohol-use status across 2017-2023 cycles.
+#
+# Manuscript-consistent definition:
+#   Alcohol use was categorized as:
+#     0 = Never
+#         - fewer than 12 drinks in lifetime
+#     1 = Non-heavy ever drinker
+#         - at least 12 drinks in lifetime, but no heavy drinking history
+#     2 = Heavy
+#         - reported heavy drinking history
+#
+# Core variables:
+#   ALQ111:
+#     Had at least 12 alcohol drinks in lifetime
+#     1 = Yes
+#     2 = No
+#     7 = Refused
+#     9 = Don't know
+#
+#   ALQ151:
+#     Ever had 4/5 or more drinks every day
+#     1 = Yes
+#     2 = No
+#     7 = Refused
+#     9 = Don't know
+#
+# Data Cycles:
+#   - 2017-March 2020: P_ALQ
+#   - 2021-2023: ALQ_L
+#
+# Output:
+#   - D:/code/6.data.rds
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+
+library(nhanesA)
+library(tidyverse)
+library(stringr)
+
+# 2. Environment ---------------------------------------------------------------
+
+export_dir <- "D:/code"
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = TRUE)
+}
+
+qc_dir <- file.path(export_dir, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 3. Helper Functions ----------------------------------------------------------
+
+clean_yes_no_code <- function(x) {
+  
+  x_chr <- as.character(x)
+  x_chr <- str_trim(x_chr)
+  x_low <- str_to_lower(x_chr)
+  
+  case_when(
+    is.na(x_chr) ~ NA_real_,
+    
+    # Numeric codes
+    x_chr == "1" ~ 1,
+    x_chr == "2" ~ 2,
+    
+    # Character labels from nhanesA
+    x_low == "yes" ~ 1,
+    x_low == "no"  ~ 2,
+    
+    # Invalid / missing response labels
+    x_low %in% c(
+      "",
+      ".",
+      "7",
+      "9",
+      "77",
+      "99",
+      "777",
+      "999",
+      "refused",
+      "don't know",
+      "dont know",
+      "missing",
+      "na"
+    ) ~ NA_real_,
+    
+    TRUE ~ NA_real_
+  )
+}
+
+process_alcohol_cycle <- function(table_name, cycle_label) {
+  
+  cat("Processing alcohol data:", cycle_label, "\n")
+  
+  raw_data <- nhanes(table_name)
+  
+  required_vars <- c("SEQN", "ALQ111", "ALQ151")
+  
+  missing_vars <- setdiff(required_vars, names(raw_data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required alcohol variables in ",
+      table_name,
+      ": ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  cat("\nRaw ALQ111 distribution for", cycle_label, ":\n")
+  print(table(raw_data$ALQ111, useNA = "ifany"))
+  
+  cat("\nRaw ALQ151 distribution for", cycle_label, ":\n")
+  print(table(raw_data$ALQ151, useNA = "ifany"))
+  
+  processed <- raw_data %>%
+    as_tibble() %>%
+    select(all_of(required_vars)) %>%
+    mutate(
+      SEQN = suppressWarnings(as.numeric(SEQN)),
+      
+      ALQ111_raw = ALQ111,
+      ALQ151_raw = ALQ151,
+      
+      ALQ111 = clean_yes_no_code(ALQ111),
+      ALQ151 = clean_yes_no_code(ALQ151),
+      
+      lifetime_12_drinks = case_when(
+        ALQ111 == 1 ~ 1,
+        ALQ111 == 2 ~ 0,
+        TRUE        ~ NA_real_
+      ),
+      
+      heavy_drinking_history = case_when(
+        ALQ151 == 1 ~ 1,
+        ALQ151 == 2 ~ 0,
+        TRUE        ~ NA_real_
+      ),
+      
+      Alcohol_Status = case_when(
+        # Never drinker: fewer than 12 drinks in lifetime
+        ALQ111 == 2 ~ 0,
+        
+        # Heavy drinker: yes to ALQ151
+        ALQ111 == 1 & ALQ151 == 1 ~ 2,
+        
+        # Non-heavy ever drinker: >=12 drinks lifetime, no to ALQ151
+        ALQ111 == 1 & ALQ151 == 2 ~ 1,
+        
+        TRUE ~ NA_real_
+      ),
+      
+      Alcohol_Label = factor(
+        Alcohol_Status,
+        levels = c(0, 1, 2),
+        labels = c(
+          "Never",
+          "Non-heavy ever drinker",
+          "Heavy"
+        )
+      ),
+      
+      # Backward-compatible aliases for older scripts
+      AlcoholCategory = Alcohol_Label,
+      Alcohol_Status_Num = Alcohol_Status,
+      
+      CYCLE = cycle_label
+    )
+  
+  return(processed)
+}
+
+# 4. Process Cycles ------------------------------------------------------------
+
+alq_1720 <- process_alcohol_cycle("P_ALQ", "2017-2020")
+alq_2123 <- process_alcohol_cycle("ALQ_L", "2021-2023")
+
+alcohol_combined <- bind_rows(alq_1720, alq_2123)
+
+# 5. Quality Control -----------------------------------------------------------
+
+cat("\n--- Alcohol Status Distribution by Cycle ---\n")
+
+alcohol_dist_cycle <- alcohol_combined %>%
+  count(CYCLE, Alcohol_Label, name = "n") %>%
+  arrange(CYCLE, Alcohol_Label)
+
+print(alcohol_dist_cycle)
+
+cat("\n--- Alcohol Status Overall Distribution ---\n")
+
+alcohol_dist_overall <- alcohol_combined %>%
+  count(Alcohol_Label, name = "n") %>%
+  arrange(Alcohol_Label)
+
+print(alcohol_dist_overall)
+
+cat("\n--- Missingness Audit ---\n")
+
+missing_audit <- alcohol_combined %>%
+  summarise(
+    n_total = n(),
+    
+    missing_ALQ111 =
+      sum(is.na(ALQ111)),
+    
+    n_lifetime_ever_drinkers =
+      sum(ALQ111 == 1, na.rm = TRUE),
+    
+    missing_ALQ151_among_lifetime_ever_drinkers =
+      sum(ALQ111 == 1 & is.na(ALQ151), na.rm = TRUE),
+    
+    missing_lifetime_12_drinks =
+      sum(is.na(lifetime_12_drinks)),
+    
+    missing_heavy_drinking_history_among_ever_drinkers =
+      sum(ALQ111 == 1 & is.na(heavy_drinking_history), na.rm = TRUE),
+    
+    missing_Alcohol_Status =
+      sum(is.na(Alcohol_Label))
+  )
+
+print(missing_audit)
+
+cat("\n--- Cross-tab: ALQ111 x ALQ151 x Alcohol Status ---\n")
+
+cross_tab <- alcohol_combined %>%
+  count(ALQ111, ALQ151, Alcohol_Label, name = "n") %>%
+  arrange(ALQ111, ALQ151, Alcohol_Label)
+
+print(cross_tab)
+
+cat("\n--- Cycle-specific Missingness Audit ---\n")
+
+missing_audit_cycle <- alcohol_combined %>%
+  group_by(CYCLE) %>%
+  summarise(
+    n_total = n(),
+    
+    missing_ALQ111 =
+      sum(is.na(ALQ111)),
+    
+    n_lifetime_ever_drinkers =
+      sum(ALQ111 == 1, na.rm = TRUE),
+    
+    missing_ALQ151_among_lifetime_ever_drinkers =
+      sum(ALQ111 == 1 & is.na(ALQ151), na.rm = TRUE),
+    
+    missing_Alcohol_Status =
+      sum(is.na(Alcohol_Label)),
+    
+    .groups = "drop"
+  )
+
+print(missing_audit_cycle)
+
+cat("\n--- Raw-label QC after harmonization ---\n")
+
+raw_label_qc <- alcohol_combined %>%
+  count(CYCLE, ALQ111_raw, ALQ151_raw, Alcohol_Label, name = "n") %>%
+  arrange(CYCLE, ALQ111_raw, ALQ151_raw, Alcohol_Label)
+
+print(raw_label_qc)
+
+# 6. Save QC Outputs -----------------------------------------------------------
+
+write_csv(
+  alcohol_dist_cycle,
+  file.path(qc_dir, "Step6_alcohol_status_distribution_by_cycle.csv")
+)
+
+write_csv(
+  alcohol_dist_overall,
+  file.path(qc_dir, "Step6_alcohol_status_distribution_overall.csv")
+)
+
+write_csv(
+  missing_audit,
+  file.path(qc_dir, "Step6_alcohol_missingness_audit.csv")
+)
+
+write_csv(
+  missing_audit_cycle,
+  file.path(qc_dir, "Step6_alcohol_missingness_audit_by_cycle.csv")
+)
+
+write_csv(
+  cross_tab,
+  file.path(qc_dir, "Step6_alcohol_ALQ111_ALQ151_crosstab.csv")
+)
+
+write_csv(
+  raw_label_qc,
+  file.path(qc_dir, "Step6_alcohol_raw_label_qc.csv")
+)
+
+# 7. Export --------------------------------------------------------------------
+
+save_path <- file.path(export_dir, "6.data.rds")
+
+saveRDS(alcohol_combined, save_path)
+
+cat("\nAlcohol data successfully exported to:", save_path, "\n")
+cat("QC files saved to:", qc_dir, "\n")
+cat(
+  "Final Dataset dimensions:",
+  dim(alcohol_combined)[1],
+  "rows and",
+  dim(alcohol_combined)[2],
+  "variables.\n"
+)
