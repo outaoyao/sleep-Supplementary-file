@@ -1,0 +1,269 @@
+################################################################################
+# Script Name: 8. Covariate Processing - Hypertension Status
+# Purpose:
+#   Harmonize NHANES hypertension status across 2017-2023 cycles.
+#
+# Manuscript-consistent definition:
+#   Hypertension was defined using self-reported physician diagnosis from BPQ020.
+#
+# Core variable:
+#   BPQ020:
+#     Ever told you had high blood pressure
+#     1 = Yes
+#     2 = No
+#     7 = Refused
+#     9 = Don't know
+#
+# Analytic variable:
+#   htn_status:
+#     0 = No
+#     1 = Yes
+#
+# Data Cycles:
+#   - 2017-March 2020: P_BPQ
+#   - 2021-2023: BPQ_L
+#
+# Output:
+#   - D:/code/8.data.rds
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+
+library(nhanesA)
+library(tidyverse)
+library(stringr)
+
+# 2. Environment ---------------------------------------------------------------
+
+export_dir <- "D:/code"
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = TRUE)
+}
+
+qc_dir <- file.path(export_dir, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 3. Helper Functions ----------------------------------------------------------
+
+clean_bpq020_code <- function(x) {
+  
+  x_chr <- as.character(x)
+  x_chr <- str_trim(x_chr)
+  x_low <- str_to_lower(x_chr)
+  
+  case_when(
+    is.na(x_chr) ~ NA_real_,
+    
+    # Numeric codes
+    x_chr == "1" ~ 1,
+    x_chr == "2" ~ 2,
+    
+    # Character labels from nhanesA
+    x_low == "yes" ~ 1,
+    x_low == "no"  ~ 2,
+    
+    # Invalid / missing response labels
+    x_low %in% c(
+      "",
+      ".",
+      "7",
+      "9",
+      "77",
+      "99",
+      "refused",
+      "don't know",
+      "dont know",
+      "missing",
+      "na"
+    ) ~ NA_real_,
+    
+    TRUE ~ NA_real_
+  )
+}
+
+process_hypertension_cycle <- function(table_name, cycle_label) {
+  
+  cat("Processing hypertension data:", cycle_label, "\n")
+  
+  raw_data <- nhanes(table_name)
+  
+  required_vars <- c("SEQN", "BPQ020")
+  
+  missing_vars <- setdiff(required_vars, names(raw_data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required hypertension variables in ",
+      table_name,
+      ": ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  cat("\nRaw BPQ020 distribution for", cycle_label, ":\n")
+  print(table(raw_data$BPQ020, useNA = "ifany"))
+  
+  processed <- raw_data %>%
+    as_tibble() %>%
+    select(all_of(required_vars)) %>%
+    mutate(
+      SEQN = suppressWarnings(as.numeric(SEQN)),
+      
+      BPQ020_raw = BPQ020,
+      
+      BPQ020 = clean_bpq020_code(BPQ020),
+      
+      htn_status = case_when(
+        BPQ020 == 1 ~ 1,
+        BPQ020 == 2 ~ 0,
+        TRUE        ~ NA_real_
+      ),
+      
+      htn_status_label = factor(
+        htn_status,
+        levels = c(0, 1),
+        labels = c(
+          "No",
+          "Yes"
+        )
+      ),
+      
+      # Backward-compatible aliases for older scripts
+      hypertension_status = htn_status,
+      hypertension_label = htn_status_label,
+      
+      CYCLE = cycle_label
+    )
+  
+  return(processed)
+}
+
+# 4. Process Cycles ------------------------------------------------------------
+
+htn_1720 <- process_hypertension_cycle("P_BPQ", "2017-2020")
+htn_2123 <- process_hypertension_cycle("BPQ_L", "2021-2023")
+
+htn_combined <- bind_rows(htn_1720, htn_2123)
+
+# 5. Quality Control -----------------------------------------------------------
+
+cat("\n--- Hypertension Distribution by Cycle ---\n")
+
+htn_dist_cycle <- htn_combined %>%
+  count(CYCLE, htn_status_label, name = "n") %>%
+  arrange(CYCLE, htn_status_label)
+
+print(htn_dist_cycle)
+
+cat("\n--- Hypertension Overall Distribution ---\n")
+
+htn_dist_overall <- htn_combined %>%
+  count(htn_status_label, name = "n") %>%
+  arrange(htn_status_label)
+
+print(htn_dist_overall)
+
+cat("\n--- Missingness Audit ---\n")
+
+missing_audit <- htn_combined %>%
+  summarise(
+    n_total = n(),
+    
+    missing_BPQ020 =
+      sum(is.na(BPQ020)),
+    
+    missing_htn_status =
+      sum(is.na(htn_status_label)),
+    
+    n_no_hypertension =
+      sum(htn_status == 0, na.rm = TRUE),
+    
+    n_hypertension =
+      sum(htn_status == 1, na.rm = TRUE)
+  )
+
+print(missing_audit)
+
+cat("\n--- Cycle-specific Missingness Audit ---\n")
+
+missing_audit_cycle <- htn_combined %>%
+  group_by(CYCLE) %>%
+  summarise(
+    n_total = n(),
+    
+    missing_BPQ020 =
+      sum(is.na(BPQ020)),
+    
+    n_no_hypertension =
+      sum(htn_status == 0, na.rm = TRUE),
+    
+    n_hypertension =
+      sum(htn_status == 1, na.rm = TRUE),
+    
+    missing_htn_status =
+      sum(is.na(htn_status_label)),
+    
+    .groups = "drop"
+  )
+
+print(missing_audit_cycle)
+
+cat("\n--- Raw-label QC after harmonization ---\n")
+
+raw_label_qc <- htn_combined %>%
+  count(
+    CYCLE,
+    BPQ020_raw,
+    htn_status_label,
+    name = "n"
+  ) %>%
+  arrange(CYCLE, BPQ020_raw, htn_status_label)
+
+print(raw_label_qc)
+
+# 6. Save QC Outputs -----------------------------------------------------------
+
+write_csv(
+  htn_dist_cycle,
+  file.path(qc_dir, "Step8_hypertension_distribution_by_cycle.csv")
+)
+
+write_csv(
+  htn_dist_overall,
+  file.path(qc_dir, "Step8_hypertension_distribution_overall.csv")
+)
+
+write_csv(
+  missing_audit,
+  file.path(qc_dir, "Step8_hypertension_missingness_audit.csv")
+)
+
+write_csv(
+  missing_audit_cycle,
+  file.path(qc_dir, "Step8_hypertension_missingness_audit_by_cycle.csv")
+)
+
+write_csv(
+  raw_label_qc,
+  file.path(qc_dir, "Step8_hypertension_raw_label_qc.csv")
+)
+
+# 7. Export --------------------------------------------------------------------
+
+save_path <- file.path(export_dir, "8.data.rds")
+
+saveRDS(htn_combined, save_path)
+
+cat("\nHypertension data successfully exported to:", save_path, "\n")
+cat("QC files saved to:", qc_dir, "\n")
+cat(
+  "Final Dataset dimensions:",
+  dim(htn_combined)[1],
+  "rows and",
+  dim(htn_combined)[2],
+  "variables.\n"
+)
