@@ -1,0 +1,373 @@
+################################################################################
+# STEP 13A
+# CREATE LEGACY RCS-COMPATIBLE DATASET
+#
+# PURPOSE:
+#   Convert new harmonized complete-case dataset
+#   into old variable naming structure so that:
+#
+#   - original svyggrcs1.8R.R workflow works unchanged
+#   - original 6-RCS framework works unchanged
+#   - original scoring framework remains reproducible
+#
+# OUTPUT:
+#   D:/code/13A.Dataset_RCS_Compatible.rds
+#
+# THIS STEP HANDLES:
+#   1. variable name back-conversion
+#   2. factor formatting
+#   3. legacy exposure aliases
+#   4. old depression variable aliases
+#   5. old covariate naming
+#
+################################################################################
+
+# ==============================================================================
+# 1. Libraries
+# ==============================================================================
+
+library(dplyr)
+
+# ==============================================================================
+# 2. Paths
+# ==============================================================================
+
+base_path <- "D:/code"
+
+input_path <- file.path(
+  base_path,
+  "12.Dataset_CompleteCase.rds"
+)
+
+output_path <- file.path(
+  base_path,
+  "13A.Dataset_RCS_Compatible.rds"
+)
+
+# ==============================================================================
+# 3. Load Data
+# ==============================================================================
+
+df <- readRDS(input_path)
+
+cat("\nDataset loaded:\n")
+cat("N =", nrow(df), "\n")
+cat("Variables =", ncol(df), "\n\n")
+
+# ==============================================================================
+# 4. Rebuild Legacy RCS-Compatible Structure
+# ==============================================================================
+
+df_rcs <- df %>%
+  
+  mutate(
+    
+    # ==========================================================================
+    # 4.1 ORIGINAL 6 SLEEP TIMING VARIABLES
+    # ==========================================================================
+    
+    # Original hour-based names used in old RCS scripts
+    
+    midpoint_wd = midpoint_wd_hour,
+    midpoint_we = midpoint_we_hour,
+    
+    sleep_onset_wd = sleep_onset_wd_hour,
+    sleep_onset_we = sleep_onset_we_hour,
+    
+    wake_time_wd = wake_time_wd_hour,
+    wake_time_we = wake_time_we_hour,
+    
+    # ==========================================================================
+    # 4.2 LEGACY ALIAS VARIABLES
+    # ==========================================================================
+    
+    sleep_midpoint_weekday_hours = midpoint_wd_hour,
+    sleep_midpoint_weekend_hours = midpoint_we_hour,
+    
+    sleep_onset_weekday_hours = sleep_onset_wd_hour,
+    sleep_onset_weekend_hours = sleep_onset_we_hour,
+    
+    wake_time_weekday_hours = wake_time_wd_hour,
+    wake_time_weekend_hours = wake_time_we_hour,
+    
+    # ==========================================================================
+    # 4.3 DEPRESSION VARIABLES
+    # ==========================================================================
+    
+    Moderate_depression_above =
+      PHQ9_depression_above_10,
+    
+    ModSevere_depression_above =
+      PHQ9_depression_above_15,
+    
+    # ==========================================================================
+    # 4.4 DEMOGRAPHICS
+    # ==========================================================================
+    
+    sex = factor(sex),
+    
+    race_ethnicity = factor(race_ethnicity),
+    
+    education = factor(education),
+    
+    marital_status = factor(marital_status),
+    
+    # ==========================================================================
+    # 4.5 SMOKING
+    # ==========================================================================
+    
+    smoke_status = factor(
+      smoke_status,
+      levels = c(0, 1, 2),
+      labels = c(
+        "Never Smoker",
+        "Former Smoker",
+        "Current Smoker"
+      )
+    ),
+    
+    # ==========================================================================
+    # 4.6 ALCOHOL
+    # ==========================================================================
+    
+    AlcoholCategory = factor(
+      Alcohol_Status,
+      levels = c(0, 1, 2),
+      labels = c(
+        "Never",
+        "Light/Moderate",
+        "Heavy"
+      )
+    ),
+    
+    # ==========================================================================
+    # 4.7 DIABETES
+    # ==========================================================================
+    
+    diabetes_status = factor(
+      diabetes_or_prediabetes,
+      levels = c(0, 1),
+      labels = c(
+        "No",
+        "Borderline/Yes"
+      )
+    ),
+    
+    # ==========================================================================
+    # 4.8 HYPERTENSION
+    # ==========================================================================
+    
+    hypertension_status = factor(
+      htn_status,
+      levels = c(0, 1),
+      labels = c(
+        "No",
+        "Yes"
+      )
+    ),
+    
+    # ==========================================================================
+    # 4.9 WORK STATUS
+    # ==========================================================================
+    
+    work_status = factor(
+      work_status,
+      levels = c(0, 1),
+      labels = c(
+        "Working",
+        "Not Working"
+      )
+    ),
+    
+    # ==========================================================================
+    # 4.10 ENSURE NUMERIC TYPES
+    # ==========================================================================
+    
+    midpoint_wd = as.numeric(midpoint_wd),
+    midpoint_we = as.numeric(midpoint_we),
+    
+    sleep_onset_wd = as.numeric(sleep_onset_wd),
+    sleep_onset_we = as.numeric(sleep_onset_we),
+    
+    wake_time_wd = as.numeric(wake_time_wd),
+    wake_time_we = as.numeric(wake_time_we),
+    
+    sleep_midpoint_weekday_hours =
+      as.numeric(sleep_midpoint_weekday_hours),
+    
+    sleep_midpoint_weekend_hours =
+      as.numeric(sleep_midpoint_weekend_hours),
+    
+    sleep_onset_weekday_hours =
+      as.numeric(sleep_onset_weekday_hours),
+    
+    sleep_onset_weekend_hours =
+      as.numeric(sleep_onset_weekend_hours),
+    
+    wake_time_weekday_hours =
+      as.numeric(wake_time_weekday_hours),
+    
+    wake_time_weekend_hours =
+      as.numeric(wake_time_weekend_hours)
+    
+  )
+
+# ==============================================================================
+# 5. QC — Verify Core RCS Variables
+# ==============================================================================
+
+cat("\n================ QC CHECK ================\n")
+
+core_vars <- c(
+  
+  # Original names
+  "midpoint_wd",
+  "midpoint_we",
+  "sleep_onset_wd",
+  "sleep_onset_we",
+  "wake_time_wd",
+  "wake_time_we",
+  
+  # Legacy aliases
+  "sleep_midpoint_weekday_hours",
+  "sleep_midpoint_weekend_hours",
+  "sleep_onset_weekday_hours",
+  "sleep_onset_weekend_hours",
+  "wake_time_weekday_hours",
+  "wake_time_weekend_hours",
+  
+  # Depression
+  "Moderate_depression_above",
+  "ModSevere_depression_above",
+  
+  # Survey
+  "SDMVPSU",
+  "SDMVSTRA",
+  "mec_adj"
+)
+
+for (v in core_vars) {
+  
+  cat(
+    v,
+    " | missing = ",
+    sum(is.na(df_rcs[[v]])),
+    "\n",
+    sep = ""
+  )
+}
+
+# ==============================================================================
+# 6. Distribution QC
+# ==============================================================================
+
+cat("\n================ DISTRIBUTION QC ================\n")
+
+dist_vars <- c(
+  "midpoint_wd",
+  "midpoint_we",
+  "sleep_onset_wd",
+  "sleep_onset_we",
+  "wake_time_wd",
+  "wake_time_we"
+)
+
+for (v in dist_vars) {
+  
+  cat("\n-----------------------------\n")
+  cat(v, "\n")
+  
+  print(
+    summary(df_rcs[[v]])
+  )
+}
+
+# ==============================================================================
+# 7. Depression Counts
+# ==============================================================================
+
+cat("\n================ DEPRESSION COUNTS ================\n")
+
+cat(
+  "\nPHQ-9 >=10:\n"
+)
+
+print(
+  table(
+    df_rcs$Moderate_depression_above,
+    useNA = "always"
+  )
+)
+
+cat(
+  "\nPHQ-9 >=15:\n"
+)
+
+print(
+  table(
+    df_rcs$ModSevere_depression_above,
+    useNA = "always"
+  )
+)
+
+# ==============================================================================
+# 8. Save Dataset
+# ==============================================================================
+
+saveRDS(
+  df_rcs,
+  output_path
+)
+
+cat("\nCompatible RCS dataset saved:\n")
+cat(output_path, "\n")
+
+# ==============================================================================
+# 9. Final Summary
+# ==============================================================================
+
+cat("\n================ FINAL SUMMARY ================\n")
+
+cat(
+  "Final N =",
+  nrow(df_rcs),
+  "\n"
+)
+
+cat(
+  "Final variables =",
+  ncol(df_rcs),
+  "\n"
+)
+
+cat(
+  "\nThis dataset is now compatible with:\n"
+)
+
+cat(
+  "- original svyggrcs1.8R.R\n"
+)
+
+cat(
+  "- original 6-variable RCS pipeline\n"
+)
+
+cat(
+  "- original score construction workflow\n"
+)
+
+cat(
+  "- original nadir extraction workflow\n"
+)
+
+cat(
+  "- original threshold classification workflow\n"
+)
+
+cat(
+  "- original Figure 2 generation\n"
+)
+
+cat(
+  "\nSTEP 13A COMPLETED SUCCESSFULLY\n"
+)
