@@ -1,0 +1,418 @@
+################################################################################
+# Script: 11. Master Data Integration
+# Purpose:
+#   Merge NHANES 2017-2023 cleaned datasets from Steps 1-10.
+#
+# Compatible with revised preprocessing scripts:
+#   1.data.rds  Demographics
+#   2.data.rds  PHQ-9 outcomes and sensitivity outcomes
+#   3.data.rds  Sleep timing and sleep duration metrics
+#   4.data.rds  Smoking status
+#   5.data.rds  BMI
+#   6.data.rds  Alcohol use
+#   7.data.rds  Diabetes / prediabetes
+#   8.data.rds  Hypertension
+#   9.data.rds  Work status
+#   10.data.rds Physical activity and sedentary behavior
+#
+# Output:
+#   - D:/code/11.Dataset.rds
+#   - D:/code/qc_outputs/Step11_master_merge_qc.csv
+################################################################################
+
+# 1. Libraries -----------------------------------------------------------------
+
+library(tidyverse)
+
+# 2. Environment ---------------------------------------------------------------
+
+base_path <- "D:/code"
+setwd(base_path)
+
+qc_dir <- file.path(base_path, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 3. Helper Functions ----------------------------------------------------------
+
+load_and_fix <- function(file_name) {
+  
+  file_path <- file.path(base_path, file_name)
+  
+  if (!file.exists(file_path)) {
+    stop("Missing required file: ", file_path)
+  }
+  
+  readRDS(file_path) %>%
+    mutate(SEQN = suppressWarnings(as.numeric(as.character(SEQN))))
+}
+
+check_duplicate_seqn <- function(df, df_name) {
+  
+  dup_n <- df %>%
+    count(SEQN, name = "n") %>%
+    filter(!is.na(SEQN), n > 1) %>%
+    nrow()
+  
+  if (dup_n > 0) {
+    stop(
+      "Duplicate SEQN detected in ",
+      df_name,
+      ". Please check before merging."
+    )
+  }
+  
+  invisible(TRUE)
+}
+
+safe_select <- function(df, vars, df_name) {
+  
+  missing_vars <- setdiff(vars, names(df))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing variables in ",
+      df_name,
+      ": ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  df %>%
+    select(all_of(vars))
+}
+
+# 4. Load and Select Datasets --------------------------------------------------
+
+cat("Step 1: Loading cleaned RDS files and standardizing SEQN...\n")
+
+# Step 1: Demographics
+df1_raw <- load_and_fix("1.data.rds")
+
+df1 <- df1_raw %>%
+  select(
+    -any_of(c(
+      "WTINTPRP", "WTMECPRP", "WTINT2YR", "WTMEC2YR",
+      "SDDSRVYR", "RIDSTATR"
+    ))
+  )
+
+# Step 2: PHQ-9 outcomes
+df2_raw <- load_and_fix("2.data.rds")
+
+df2 <- safe_select(
+  df2_raw,
+  c(
+    "SEQN",
+    
+    "DPQ010", "DPQ020", "DPQ030", "DPQ040", "DPQ050",
+    "DPQ060", "DPQ070", "DPQ080", "DPQ090",
+    
+    "PHQ9_ITEM_MISSING_N",
+    "PHQ9_SCORE",
+    "PHQ9_depression_above_10",
+    "Moderate_depression_above",
+    
+    "PHQ9_depression_above_15",
+    "ModSevere_depression_above",
+    
+    "PHQ9_no_sleep_ITEM_MISSING_N",
+    "PHQ9_no_sleep_SCORE",
+    "PHQ9_no_sleep_depression_above_10",
+    "PHQ9_no_sleep_depression_above_9",
+    
+    "suicidal_ideation_any",
+    "suicidal_ideation_daily",
+    
+    "PHQ9_Category_Num",
+    "PHQ9_Category"
+  ),
+  "2.data.rds"
+)
+
+# Step 3: Sleep metrics
+df3_raw <- load_and_fix("3.data.rds")
+
+df3 <- safe_select(
+  df3_raw,
+  c(
+    "SEQN",
+    
+    "dur_wd_raw",
+    "dur_we_raw",
+    "dur_wd_implausible_flag",
+    "dur_we_implausible_flag",
+    
+    "dur_wd",
+    "dur_we",
+    
+    "sleep_onset_wd_raw",
+    "wake_time_wd_raw",
+    "sleep_onset_we_raw",
+    "wake_time_we_raw",
+    
+    "sleep_onset_wd_min",
+    "wake_time_wd_min",
+    "sleep_onset_we_min",
+    "wake_time_we_min",
+    
+    "sleep_onset_wd_hour",
+    "wake_time_wd_hour",
+    "sleep_onset_we_hour",
+    "wake_time_we_hour",
+    
+    "midpoint_wd_min",
+    "midpoint_we_min",
+    "midpoint_wd_hour",
+    "midpoint_we_hour",
+    "midpoint_wd_hhmm",
+    "midpoint_we_hhmm",
+    
+    "SJL_raw_min",
+    "SJL_abs_min",
+    "SJL_abs_hour",
+    
+    "WCS_raw_hour",
+    "WCS_abs_hour",
+    
+    "dur_wd_cat",
+    "dur_we_cat",
+    "dur_wd_cat_num",
+    "dur_we_cat_num"
+  ),
+  "3.data.rds"
+)
+
+# Step 4: Smoking
+df4_raw <- load_and_fix("4.data.rds")
+
+df4 <- safe_select(
+  df4_raw,
+  c(
+    "SEQN",
+    "SMQ020",
+    "SMQ040",
+    "smoked_100_cigarettes",
+    "current_smoking_now_among_ever_smokers",
+    "smoke_status",
+    "smoke_status_num",
+    "smoke_status_label",
+    "smoke_label"
+  ),
+  "4.data.rds"
+)
+
+# Step 5: BMI
+df5_raw <- load_and_fix("5.data.rds")
+
+df5 <- safe_select(
+  df5_raw,
+  c(
+    "SEQN",
+    "BMI_raw",
+    "BMI_implausible_flag",
+    "BMI_value",
+    "BMI_cat",
+    "BMI_cat_ordinal",
+    "BMI_detailed",
+    "BMI_detailed_ordinal"
+  ),
+  "5.data.rds"
+)
+
+# Step 6: Alcohol
+df6_raw <- load_and_fix("6.data.rds")
+
+df6 <- safe_select(
+  df6_raw,
+  c(
+    "SEQN",
+    "ALQ111",
+    "ALQ151",
+    "lifetime_12_drinks",
+    "heavy_drinking_history",
+    "Alcohol_Status",
+    "Alcohol_Status_Num",
+    "Alcohol_Label",
+    "AlcoholCategory"
+  ),
+  "6.data.rds"
+)
+
+# Step 7: Diabetes / prediabetes
+df7_raw <- load_and_fix("7.data.rds")
+
+df7 <- safe_select(
+  df7_raw,
+  c(
+    "SEQN",
+    "DIQ010",
+    "diabetes_status_3level",
+    "diabetes_status_3level_label",
+    "diabetes_or_prediabetes",
+    "diabetes_or_prediabetes_label",
+    "diabetes_status",
+    "diabetes_label"
+  ),
+  "7.data.rds"
+)
+
+# Step 8: Hypertension
+df8_raw <- load_and_fix("8.data.rds")
+
+df8 <- safe_select(
+  df8_raw,
+  c(
+    "SEQN",
+    "BPQ020",
+    "htn_status",
+    "htn_status_label",
+    "hypertension_status",
+    "hypertension_label"
+  ),
+  "8.data.rds"
+)
+
+# Step 9: Work status
+df9_raw <- load_and_fix("9.data.rds")
+
+df9 <- safe_select(
+  df9_raw,
+  c(
+    "SEQN",
+    "OCD150",
+    "work_status",
+    "work_status_label",
+    "employment_status",
+    "employment_label"
+  ),
+  "9.data.rds"
+)
+
+# Step 10: Physical activity and sedentary behavior
+df10_raw <- load_and_fix("10.data.rds")
+
+df10 <- safe_select(
+  df10_raw,
+  c(
+    "SEQN",
+    
+    "MET_high_raw",
+    "MET_mod_raw",
+    "MET_total_raw",
+    "MET_total_truncated_flag",
+    "MET_total",
+    
+    "MET_cat_label",
+    "MET_cat_num",
+    
+    "sedentary_min_raw",
+    "sedentary_truncated_flag",
+    "sedentary_min",
+    
+    "sedentary_cat_label",
+    "sedentary_cat_num"
+  ),
+  "10.data.rds"
+)
+
+# 5. Duplicate SEQN Checks -----------------------------------------------------
+
+cat("Step 2: Checking duplicate SEQN within each dataset...\n")
+
+data_named_list <- list(
+  df1 = df1,
+  df2 = df2,
+  df3 = df3,
+  df4 = df4,
+  df5 = df5,
+  df6 = df6,
+  df7 = df7,
+  df8 = df8,
+  df9 = df9,
+  df10 = df10
+)
+
+walk2(
+  data_named_list,
+  names(data_named_list),
+  check_duplicate_seqn
+)
+
+# 6. Sequential Merge ----------------------------------------------------------
+
+cat("Step 3: Merging datasets by SEQN using demographics as the analytic spine...\n")
+
+final_dataset <- data_named_list %>%
+  reduce(left_join, by = "SEQN")
+
+# 7. Final QC ------------------------------------------------------------------
+
+cat("\nStep 4: Final merge QC...\n")
+
+merge_qc <- tibble(
+  dataset = names(data_named_list),
+  n_rows = map_int(data_named_list, nrow),
+  n_unique_seqn = map_int(data_named_list, ~ n_distinct(.x$SEQN, na.rm = TRUE)),
+  n_missing_seqn = map_int(data_named_list, ~ sum(is.na(.x$SEQN)))
+)
+
+print(merge_qc)
+
+final_missing_qc <- final_dataset %>%
+  summarise(
+    n_total = n(),
+    
+    missing_demo_weight = sum(is.na(mec_adj)),
+    zero_or_negative_mec_weight = sum(!is.na(mec_adj) & mec_adj <= 0),
+    
+    missing_PHQ9 = sum(is.na(PHQ9_SCORE)),
+    missing_PHQ9_main_outcome =
+      sum(is.na(PHQ9_depression_above_10)),
+    
+    missing_sleep_duration_wd = sum(is.na(dur_wd)),
+    missing_sleep_duration_we = sum(is.na(dur_we)),
+    missing_midpoint_wd = sum(is.na(midpoint_wd_min)),
+    missing_midpoint_we = sum(is.na(midpoint_we_min)),
+    
+    missing_smoking = sum(is.na(smoke_status)),
+    missing_BMI = sum(is.na(BMI_value)),
+    missing_alcohol = sum(is.na(Alcohol_Status)),
+    missing_diabetes = sum(is.na(diabetes_or_prediabetes)),
+    missing_hypertension = sum(is.na(htn_status)),
+    missing_work_status = sum(is.na(work_status)),
+    missing_MET = sum(is.na(MET_total)),
+    missing_sedentary = sum(is.na(sedentary_min))
+  )
+
+print(final_missing_qc)
+
+cat("\nFinal Dimensions:",
+    dim(final_dataset)[1],
+    "rows and",
+    dim(final_dataset)[2],
+    "variables.\n")
+
+cat("SEQN type:", class(final_dataset$SEQN), "\n")
+
+# 8. Save Outputs --------------------------------------------------------------
+
+saveRDS(final_dataset, file.path(base_path, "11.Dataset.rds"))
+
+write_csv(
+  merge_qc,
+  file.path(qc_dir, "Step11_master_merge_dataset_size_qc.csv")
+)
+
+write_csv(
+  final_missing_qc,
+  file.path(qc_dir, "Step11_master_merge_missingness_qc.csv")
+)
+
+cat("\nMaster dataset saved to:",
+    file.path(base_path, "11.Dataset.rds"),
+    "\n")
+
+cat("QC files saved to:", qc_dir, "\n")
