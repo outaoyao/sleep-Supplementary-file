@@ -1,0 +1,1054 @@
+################################################################################
+# STEP 16
+# Sleep Onset Timing and Depression
+# Weighted Restricted Cubic Spline Analysis
+# Dataset: 12.Dataset_CompleteCase.rds
+#
+# This script follows Step 15 midpoint RCS main-analysis logic.
+# Only changed:
+#   1. Exposure variables:
+#        midpoint_wd_hour -> sleep_onset_wd_hour / onset_wd_hour
+#        midpoint_we_hour -> sleep_onset_we_hour / onset_we_hour
+#   2. Output names:
+#        Step15 -> Step16
+#   3. Figure colors:
+#        Weekday = "#0072B2"
+#        Weekend = "#D55E00"
+################################################################################
+
+rm(list = ls())
+
+library(survey)
+library(rms)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+
+options(survey.lonely.psu = "adjust")
+
+# ==============================================================================
+# 0. Paths
+# ==============================================================================
+
+root_dir <- "D:/code"
+data_path <- file.path(root_dir, "12.Dataset_CompleteCase.rds")
+
+out_dir <- file.path(root_dir, "Step16_sleep_onset_RCS")
+fig_dir <- file.path(out_dir, "figures")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ==============================================================================
+# 1. Load data
+# ==============================================================================
+
+nhanes_data <- readRDS(data_path)
+nhanes_data <- as.data.frame(nhanes_data)
+
+cat("Loaded dataset:\n")
+cat("Rows:", nrow(nhanes_data), "\n")
+cat("Cols:", ncol(nhanes_data), "\n\n")
+
+# ==============================================================================
+# 2. Exposure variables — sleep onset timing
+# ==============================================================================
+
+# Weekday onset
+if ("sleep_onset_wd_hour" %in% names(nhanes_data)) {
+  
+  nhanes_data$sleep_onset_weekday_hours <- nhanes_data$sleep_onset_wd_hour
+  
+} else if ("onset_wd_hour" %in% names(nhanes_data)) {
+  
+  nhanes_data$sleep_onset_weekday_hours <- nhanes_data$onset_wd_hour
+  
+} else if ("sleep_onset_weekday_hours" %in% names(nhanes_data)) {
+  
+  nhanes_data$sleep_onset_weekday_hours <- nhanes_data$sleep_onset_weekday_hours
+  
+} else {
+  
+  stop("Cannot identify weekday sleep onset variable.")
+}
+
+# Weekend onset
+if ("sleep_onset_we_hour" %in% names(nhanes_data)) {
+  
+  nhanes_data$sleep_onset_weekend_hours <- nhanes_data$sleep_onset_we_hour
+  
+} else if ("onset_we_hour" %in% names(nhanes_data)) {
+  
+  nhanes_data$sleep_onset_weekend_hours <- nhanes_data$onset_we_hour
+  
+} else if ("sleep_onset_weekend_hours" %in% names(nhanes_data)) {
+  
+  nhanes_data$sleep_onset_weekend_hours <- nhanes_data$sleep_onset_weekend_hours
+  
+} else {
+  
+  stop("Cannot identify weekend sleep onset variable.")
+}
+
+cat("Exposure sanity check:\n")
+cat("Weekday:",
+    round(min(nhanes_data$sleep_onset_weekday_hours, na.rm = TRUE), 2),
+    "-",
+    round(max(nhanes_data$sleep_onset_weekday_hours, na.rm = TRUE), 2),
+    "h | median =",
+    round(median(nhanes_data$sleep_onset_weekday_hours, na.rm = TRUE), 2),
+    "h\n")
+
+cat("Weekend:",
+    round(min(nhanes_data$sleep_onset_weekend_hours, na.rm = TRUE), 2),
+    "-",
+    round(max(nhanes_data$sleep_onset_weekend_hours, na.rm = TRUE), 2),
+    "h | median =",
+    round(median(nhanes_data$sleep_onset_weekend_hours, na.rm = TRUE), 2),
+    "h\n\n")
+
+# ==============================================================================
+# 3. Factor covariates
+# ==============================================================================
+
+factor_vars <- c(
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "smoke_label",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label"
+)
+
+for (v in factor_vars) {
+  if (v %in% names(nhanes_data)) {
+    nhanes_data[[v]] <- as.factor(nhanes_data[[v]])
+  }
+}
+
+# ==============================================================================
+# 4. Variables
+# ==============================================================================
+
+outcome_var <- "Moderate_depression_above"
+
+exposure_weekday <- "sleep_onset_weekday_hours"
+exposure_weekend <- "sleep_onset_weekend_hours"
+
+base_vars <- c(
+  "SEQN",
+  "SDMVPSU",
+  "SDMVSTRA",
+  "mec_adj",
+  outcome_var,
+  exposure_weekday,
+  exposure_weekend
+)
+
+model2_covars <- c(
+  "RIDAGEYR",
+  "sex",
+  "race_ethnicity"
+)
+
+model3_covars <- c(
+  model2_covars,
+  "education",
+  "marital_status",
+  "smoke_label",
+  "BMI_value",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label",
+  "MET_total",
+  "INDFMPIR"
+)
+
+model4_covars <- c(
+  model3_covars,
+  "sedentary_min"
+)
+
+required_vars <- unique(c(base_vars, model4_covars))
+
+missing_vars <- setdiff(required_vars, names(nhanes_data))
+if (length(missing_vars) > 0) {
+  stop(
+    paste0(
+      "Missing variables: ",
+      paste(missing_vars, collapse = ", ")
+    )
+  )
+}
+
+# ==============================================================================
+# 5. Complete-case analytic sample
+# ==============================================================================
+
+nhanes_rcs <- nhanes_data %>%
+  dplyr::select(all_of(required_vars)) %>%
+  dplyr::filter(
+    complete.cases(.),
+    mec_adj > 0,
+    SDMVPSU > 0,
+    SDMVSTRA > 0
+  )
+
+cat("Analytic sample: n =", nrow(nhanes_rcs), "\n")
+cat("Outcome distribution:\n")
+print(table(nhanes_rcs[[outcome_var]], useNA = "ifany"))
+
+cat("\nWeekday onset quantiles:\n")
+print(quantile(
+  nhanes_rcs$sleep_onset_weekday_hours,
+  probs = c(0, 0.01, 0.05, 0.5, 0.95, 0.99, 1),
+  na.rm = TRUE
+))
+
+cat("\nWeekend onset quantiles:\n")
+print(quantile(
+  nhanes_rcs$sleep_onset_weekend_hours,
+  probs = c(0, 0.01, 0.05, 0.5, 0.95, 0.99, 1),
+  na.rm = TRUE
+))
+
+# ==============================================================================
+# 6. Survey design
+# ==============================================================================
+
+dd <- datadist(nhanes_rcs)
+options(datadist = "dd")
+
+design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = nhanes_rcs,
+  nest = TRUE
+)
+
+# ==============================================================================
+# 7. Model helpers
+# ==============================================================================
+
+make_formula <- function(exposure, covars = NULL, knots = 4) {
+  
+  rhs <- paste0("rcs(", exposure, ", ", knots, ")")
+  
+  if (!is.null(covars) && length(covars) > 0) {
+    rhs <- paste(rhs, paste(covars, collapse = " + "), sep = " + ")
+  }
+  
+  as.formula(paste(outcome_var, "~", rhs))
+}
+
+fit_svy_rcs <- function(exposure, covars = NULL, knots = 4) {
+  
+  svyglm(
+    formula = make_formula(exposure, covars, knots),
+    design = design,
+    family = quasibinomial()
+  )
+}
+
+# ==============================================================================
+# 8. Fit models
+# ==============================================================================
+
+cat("\nFitting RCS models...\n")
+
+model_weekday_m1 <- fit_svy_rcs(exposure_weekday, NULL, 4)
+model_weekday_m2 <- fit_svy_rcs(exposure_weekday, model2_covars, 4)
+model_weekday_m3 <- fit_svy_rcs(exposure_weekday, model3_covars, 4)
+model_weekday_m4 <- fit_svy_rcs(exposure_weekday, model4_covars, 4)
+
+model_weekend_m1 <- fit_svy_rcs(exposure_weekend, NULL, 4)
+model_weekend_m2 <- fit_svy_rcs(exposure_weekend, model2_covars, 4)
+model_weekend_m3 <- fit_svy_rcs(exposure_weekend, model3_covars, 4)
+model_weekend_m4 <- fit_svy_rcs(exposure_weekend, model4_covars, 4)
+
+cat("All RCS models fitted.\n\n")
+
+# ==============================================================================
+# 9. Knot sensitivity
+# ==============================================================================
+
+compare_knots <- function(exposure, covars = model4_covars) {
+  
+  out <- data.frame(
+    exposure = exposure,
+    knots = 3:5,
+    AIC = NA_real_,
+    p_compare_linear = NA_real_
+  )
+  
+  lin_formula <- as.formula(
+    paste(
+      outcome_var,
+      "~",
+      paste(c(exposure, covars), collapse = " + ")
+    )
+  )
+  
+  lin_fit <- svyglm(
+    lin_formula,
+    design = design,
+    family = quasibinomial()
+  )
+  
+  for (k in 3:5) {
+    
+    spline_fit <- fit_svy_rcs(exposure, covars, k)
+    
+    out$AIC[out$knots == k] <- AIC(spline_fit)[1]
+    
+    out$p_compare_linear[out$knots == k] <- tryCatch(
+      anova(lin_fit, spline_fit)$p[2],
+      error = function(e) NA_real_
+    )
+  }
+  
+  out
+}
+
+knot_results <- rbind(
+  compare_knots(exposure_weekday),
+  compare_knots(exposure_weekend)
+)
+
+write.csv(
+  knot_results,
+  file.path(out_dir, "Step16_knot_sensitivity.csv"),
+  row.names = FALSE
+)
+
+cat("Knot sensitivity results:\n")
+print(knot_results)
+
+# ==============================================================================
+# 10. Reference data builder
+#     Important: force prediction grid to 0–24 h.
+# ==============================================================================
+
+get_mode_value <- function(x) {
+  x <- x[!is.na(x)]
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+
+make_reference_newdata <- function(data, exposure, n_grid = 200,
+                                   force_range = c(0, 24)) {
+  
+  grid <- seq(
+    force_range[1],
+    force_range[2],
+    length.out = n_grid
+  )
+  
+  newdat <- data.frame(tmp_exposure = grid)
+  names(newdat)[1] <- exposure
+  
+  for (v in model4_covars) {
+    
+    if (v == exposure) next
+    
+    if (is.factor(data[[v]])) {
+      
+      ref <- get_mode_value(data[[v]])
+      
+      newdat[[v]] <- factor(
+        ref,
+        levels = levels(data[[v]])
+      )
+      
+    } else {
+      
+      newdat[[v]] <- median(data[[v]], na.rm = TRUE)
+    }
+  }
+  
+  newdat
+}
+
+# ==============================================================================
+# 11. Manual RCS prediction using model matrix
+# ==============================================================================
+
+extract_rcs_data_manual <- function(model, exposure, time_type, model_name) {
+  
+  newdat <- make_reference_newdata(
+    data = nhanes_rcs,
+    exposure = exposure,
+    n_grid = 200,
+    force_range = c(0, 24)
+  )
+  
+  model_terms <- delete.response(terms(model))
+  
+  X <- model.matrix(
+    model_terms,
+    data = newdat
+  )
+  
+  coefs <- coef(model)
+  V <- vcov(model)
+  
+  common <- intersect(colnames(X), names(coefs))
+  
+  X <- X[, common, drop = FALSE]
+  coefs <- coefs[common]
+  V <- V[common, common, drop = FALSE]
+  
+  fit <- as.numeric(X %*% coefs)
+  se <- sqrt(pmax(0, rowSums((X %*% V) * X)))
+  
+  ref_fit <- min(fit, na.rm = TRUE)
+  
+  dat <- data.frame(
+    hours = newdat[[exposure]],
+    yhat = exp(fit - ref_fit),
+    lower = exp((fit - 1.96 * se) - ref_fit),
+    upper = exp((fit + 1.96 * se) - ref_fit),
+    time_type = time_type,
+    model = model_name
+  )
+  
+  dat <- dat[complete.cases(dat), ]
+  
+  dat
+}
+
+cat("\nExtracting RCS plotting data over 0–24 h...\n")
+
+data_weekday_m1 <- extract_rcs_data_manual(model_weekday_m1, exposure_weekday, "Weekday", "Model 1")
+data_weekday_m2 <- extract_rcs_data_manual(model_weekday_m2, exposure_weekday, "Weekday", "Model 2")
+data_weekday_m3 <- extract_rcs_data_manual(model_weekday_m3, exposure_weekday, "Weekday", "Model 3")
+data_weekday_m4 <- extract_rcs_data_manual(model_weekday_m4, exposure_weekday, "Weekday", "Model 4")
+
+data_weekend_m1 <- extract_rcs_data_manual(model_weekend_m1, exposure_weekend, "Weekend", "Model 1")
+data_weekend_m2 <- extract_rcs_data_manual(model_weekend_m2, exposure_weekend, "Weekend", "Model 2")
+data_weekend_m3 <- extract_rcs_data_manual(model_weekend_m3, exposure_weekend, "Weekend", "Model 3")
+data_weekend_m4 <- extract_rcs_data_manual(model_weekend_m4, exposure_weekend, "Weekend", "Model 4")
+
+model1_data <- rbind(data_weekday_m1, data_weekend_m1)
+model2_data <- rbind(data_weekday_m2, data_weekend_m2)
+model3_data <- rbind(data_weekday_m3, data_weekend_m3)
+model4_data <- rbind(data_weekday_m4, data_weekend_m4)
+
+all_rcs_plot_data <- rbind(
+  model1_data,
+  model2_data,
+  model3_data,
+  model4_data
+)
+
+write.csv(
+  all_rcs_plot_data,
+  file.path(out_dir, "Step16_RCS_plot_data_all_models_0_24h.csv"),
+  row.names = FALSE
+)
+
+cat("RCS plotting data extracted successfully.\n")
+
+cat("\nPlot data range check:\n")
+print(
+  all_rcs_plot_data %>%
+    group_by(model, time_type) %>%
+    summarise(
+      min_hour = min(hours),
+      max_hour = max(hours),
+      .groups = "drop"
+    )
+)
+
+# ==============================================================================
+# 12. Risk threshold configuration
+# ==============================================================================
+
+VAL_REF <- 1.05
+VAL_MILD <- 1.20
+VAL_MODERATE <- 1.50
+
+# ==============================================================================
+# 13. Nadir and reference interval
+# ==============================================================================
+
+summarise_nadir <- function(dat, label) {
+  
+  idx <- which.min(dat$yhat)
+  nadir_or <- dat$yhat[idx]
+  
+  ref_dat <- dat[dat$yhat <= VAL_REF * nadir_or, ]
+  
+  data.frame(
+    timing = label,
+    nadir_hour = dat$hours[idx],
+    nadir_or = nadir_or,
+    reference_start_hour = min(ref_dat$hours, na.rm = TRUE),
+    reference_end_hour = max(ref_dat$hours, na.rm = TRUE)
+  )
+}
+
+nadir_results <- rbind(
+  summarise_nadir(data_weekday_m4, "Weekday"),
+  summarise_nadir(data_weekend_m4, "Weekend")
+)
+
+write.csv(
+  nadir_results,
+  file.path(out_dir, "Step16_Model4_nadir_reference_interval_0_24h.csv"),
+  row.names = FALSE
+)
+
+cat("\nNadir and reference interval:\n")
+print(nadir_results)
+
+# ==============================================================================
+# 14. Gradient interval summary
+# ==============================================================================
+
+map_or_to_score <- function(hours_val, rcs_plot_data) {
+  
+  if (is.na(hours_val)) return(NA_integer_)
+  
+  idx <- which.min(abs(rcs_plot_data$hours - hours_val))
+  predicted_or <- rcs_plot_data$yhat[idx]
+  nadir_or <- min(rcs_plot_data$yhat, na.rm = TRUE)
+  
+  dplyr::case_when(
+    predicted_or <= VAL_REF * nadir_or ~ 0L,
+    predicted_or <= VAL_MILD * nadir_or ~ 1L,
+    predicted_or <= VAL_MODERATE * nadir_or ~ 2L,
+    TRUE ~ 3L
+  )
+}
+
+summarize_rcs_intervals <- function(rcs_data, label) {
+  
+  rcs_data$score <- sapply(
+    rcs_data$hours,
+    map_or_to_score,
+    rcs_plot_data = rcs_data
+  )
+  
+  gradient_labels <- c(
+    "0" = "Reference",
+    "1" = "Mild",
+    "2" = "Moderate",
+    "3" = "High"
+  )
+  
+  tab <- rcs_data %>%
+    group_by(score) %>%
+    summarise(
+      Start_Hour = min(hours),
+      End_Hour = max(hours),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Gradient = gradient_labels[as.character(score)],
+      Timing = label
+    )
+  
+  tab
+}
+
+interval_weekday_m4 <- summarize_rcs_intervals(data_weekday_m4, "Weekday")
+interval_weekend_m4 <- summarize_rcs_intervals(data_weekend_m4, "Weekend")
+
+gradient_intervals <- rbind(
+  interval_weekday_m4,
+  interval_weekend_m4
+)
+
+write.csv(
+  gradient_intervals,
+  file.path(out_dir, "Step16_Model4_gradient_intervals_0_24h.csv"),
+  row.names = FALSE
+)
+
+cat("\nGradient intervals:\n")
+print(gradient_intervals)
+
+# ==============================================================================
+# 15. Individual-level score
+# ==============================================================================
+
+nhanes_scored <- nhanes_data %>%
+  mutate(
+    sleep_onset_weekday_hours = sleep_onset_weekday_hours,
+    sleep_onset_weekend_hours = sleep_onset_weekend_hours,
+    
+    weekday_onset_score = sapply(
+      sleep_onset_weekday_hours,
+      map_or_to_score,
+      rcs_plot_data = data_weekday_m4
+    ),
+    
+    weekend_onset_score = sapply(
+      sleep_onset_weekend_hours,
+      map_or_to_score,
+      rcs_plot_data = data_weekend_m4
+    ),
+    
+    sleep_onset_total_score =
+      weekday_onset_score + weekend_onset_score
+  )
+
+cat("\nWeekday onset score distribution:\n")
+print(table(nhanes_scored$weekday_onset_score, useNA = "ifany"))
+
+cat("\nWeekend onset score distribution:\n")
+print(table(nhanes_scored$weekend_onset_score, useNA = "ifany"))
+
+cat("\nTotal onset score distribution:\n")
+print(table(nhanes_scored$sleep_onset_total_score, useNA = "ifany"))
+
+score_dist <- as.data.frame(
+  table(
+    Weekday = nhanes_scored$weekday_onset_score,
+    Weekend = nhanes_scored$weekend_onset_score,
+    Total = nhanes_scored$sleep_onset_total_score,
+    useNA = "ifany"
+  )
+)
+
+write.csv(
+  score_dist,
+  file.path(out_dir, "Step16_onset_score_distribution_0_24h.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  nhanes_scored,
+  file.path(root_dir, "16.Sleep_onset_scored.rds")
+)
+
+# ==============================================================================
+# 16. Figures
+# ==============================================================================
+
+journal_theme_bare <- function(base_size = 10) {
+  
+  theme_bw(base_size = base_size, base_family = "Arial") +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(
+        colour = "black",
+        linewidth = 0.6,
+        fill = NA
+      ),
+      axis.title = element_blank(),
+      axis.text = element_text(
+        colour = "black",
+        size = base_size * 0.9
+      ),
+      axis.ticks = element_line(
+        colour = "black",
+        linewidth = 0.35
+      ),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none",
+      plot.title = element_blank(),
+      plot.margin = margin(6, 8, 4, 6)
+    )
+}
+
+color_scheme <- c(
+  "Weekday" = "#0072B2",
+  "Weekend" = "#D55E00"
+)
+
+build_bare_panel <- function(dat) {
+  
+  plot_data <- dat %>%
+    mutate(
+      time_type = factor(
+        time_type,
+        levels = c("Weekday", "Weekend")
+      )
+    )
+  
+  y_raw_min <- min(plot_data$lower, na.rm = TRUE)
+  y_raw_max <- max(plot_data$upper, na.rm = TRUE)
+  
+  y_lo <- max(0, floor(y_raw_min * 2) / 2)
+  y_hi <- ceiling(y_raw_max * 2) / 2
+  
+  y_lo <- min(y_lo, 0.8)
+  y_hi <- max(y_hi, 1.5)
+  
+  y_breaks <- pretty(c(y_lo, y_hi), n = 5)
+  y_breaks <- y_breaks[y_breaks >= y_lo & y_breaks <= y_hi]
+  
+  ggplot(
+    plot_data,
+    aes(
+      x = hours,
+      y = yhat,
+      group = time_type
+    )
+  ) +
+    geom_ribbon(
+      aes(
+        ymin = lower,
+        ymax = upper,
+        fill = time_type
+      ),
+      alpha = 0.18,
+      colour = NA
+    ) +
+    geom_hline(
+      yintercept = 1,
+      linetype = "dashed",
+      colour = "grey40",
+      linewidth = 0.45
+    ) +
+    geom_line(
+      aes(colour = time_type),
+      linewidth = 0.85
+    ) +
+    scale_colour_manual(values = color_scheme) +
+    scale_fill_manual(values = color_scheme) +
+    scale_x_continuous(
+      breaks = seq(0, 24, by = 4),
+      limits = c(0, 24),
+      expand = expansion(mult = c(0.01, 0.01))
+    ) +
+    scale_y_continuous(
+      limits = c(y_lo, y_hi),
+      breaks = y_breaks,
+      expand = expansion(mult = c(0, 0.02))
+    ) +
+    journal_theme_bare()
+}
+
+panel_m1 <- build_bare_panel(model1_data)
+panel_m2 <- build_bare_panel(model2_data)
+panel_m3 <- build_bare_panel(model3_data)
+panel_m4 <- build_bare_panel(model4_data)
+
+combined_plot <- cowplot::plot_grid(
+  panel_m1,
+  panel_m2,
+  panel_m3,
+  panel_m4,
+  ncol = 2,
+  labels = c("A", "B", "C", "D"),
+  label_fontface = "bold",
+  label_size = 11
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step16_RCS_4models_combined_0_24h.png"),
+  plot = combined_plot,
+  width = 7.0,
+  height = 6.0,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step16_RCS_4models_combined_0_24h.tiff"),
+  plot = combined_plot,
+  width = 7.0,
+  height = 6.0,
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step16_RCS_Model4_onset_0_24h.png"),
+  plot = panel_m4,
+  width = 3.5,
+  height = 3.2,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step16_RCS_Model4_onset_0_24h.tiff"),
+  plot = panel_m4,
+  width = 3.5,
+  height = 3.2,
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step16_RCS_Model4_onset_0_24h_wide.png"),
+  plot = panel_m4,
+  width = 5.0,
+  height = 4.2,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step16_RCS_Model4_onset_0_24h_wide.tiff"),
+  plot = panel_m4,
+  width = 5.0,
+  height = 4.2,
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+cat("\nFigures saved to:", fig_dir, "\n")
+
+# ==============================================================================
+# 17. QC summary
+# ==============================================================================
+
+qc <- data.frame(
+  item = c(
+    "input_file",
+    "n_original",
+    "n_analytic",
+    "outcome_variable",
+    "weekday_exposure",
+    "weekend_exposure",
+    "prediction_grid",
+    "weight",
+    "psu",
+    "strata",
+    "output_scored_rds",
+    "nadir_weekday_h",
+    "nadir_weekend_h"
+  ),
+  value = c(
+    data_path,
+    nrow(nhanes_data),
+    nrow(nhanes_rcs),
+    outcome_var,
+    exposure_weekday,
+    exposure_weekend,
+    "0-24 hours",
+    "mec_adj",
+    "SDMVPSU",
+    "SDMVSTRA",
+    file.path(root_dir, "16.Sleep_onset_scored.rds"),
+    round(nadir_results$nadir_hour[nadir_results$timing == "Weekday"], 2),
+    round(nadir_results$nadir_hour[nadir_results$timing == "Weekend"], 2)
+  )
+)
+
+write.csv(
+  qc,
+  file.path(out_dir, "Step16_QC_summary_0_24h.csv"),
+  row.names = FALSE
+)
+
+cat("\n============================================================\n")
+cat("STEP 16 COMPLETE\n")
+cat("============================================================\n")
+cat("Scored RDS :", file.path(root_dir, "16.Sleep_onset_scored.rds"), "\n")
+cat("Output dir :", out_dir, "\n")
+cat("Figures dir:", fig_dir, "\n")
+cat("============================================================\n")
+
+# ==============================================================================
+# 18. Formal weighted RCS P values for all models
+#     Overall P   = Wald test for all RCS coefficients
+#     Nonlinear P = Wald test for nonlinear RCS coefficients only
+# ==============================================================================
+
+wald_test_terms <- function(model, term_index) {
+  
+  beta <- coef(model)
+  V <- vcov(model)
+  
+  term_index <- term_index[!is.na(term_index)]
+  
+  if (length(term_index) == 0) {
+    return(NA_real_)
+  }
+  
+  b <- beta[term_index]
+  VV <- V[term_index, term_index, drop = FALSE]
+  
+  stat <- as.numeric(t(b) %*% solve(VV) %*% b)
+  df <- length(b)
+  
+  p <- pchisq(stat, df = df, lower.tail = FALSE)
+  
+  return(p)
+}
+
+get_rcs_pvalues_wald <- function(model, exposure, model_name, timing_label) {
+  
+  coef_names <- names(coef(model))
+  
+  rcs_index <- grep(
+    exposure,
+    coef_names,
+    fixed = TRUE
+  )
+  
+  if (length(rcs_index) == 0) {
+    stop(paste0("No RCS coefficients found for: ", exposure))
+  }
+  
+  linear_index <- rcs_index[1]
+  nonlinear_index <- rcs_index[-1]
+  
+  overall_p <- wald_test_terms(
+    model = model,
+    term_index = rcs_index
+  )
+  
+  nonlinear_p <- wald_test_terms(
+    model = model,
+    term_index = nonlinear_index
+  )
+  
+  data.frame(
+    model = model_name,
+    timing = timing_label,
+    exposure = exposure,
+    n_rcs_terms = length(rcs_index),
+    overall_p = overall_p,
+    nonlinear_p = nonlinear_p,
+    coef_names = paste(coef_names[rcs_index], collapse = " | ")
+  )
+}
+
+rcs_pvalues_all_models <- rbind(
+  get_rcs_pvalues_wald(model_weekday_m1, exposure_weekday, "Model 1", "Weekday"),
+  get_rcs_pvalues_wald(model_weekday_m2, exposure_weekday, "Model 2", "Weekday"),
+  get_rcs_pvalues_wald(model_weekday_m3, exposure_weekday, "Model 3", "Weekday"),
+  get_rcs_pvalues_wald(model_weekday_m4, exposure_weekday, "Model 4", "Weekday"),
+  
+  get_rcs_pvalues_wald(model_weekend_m1, exposure_weekend, "Model 1", "Weekend"),
+  get_rcs_pvalues_wald(model_weekend_m2, exposure_weekend, "Model 2", "Weekend"),
+  get_rcs_pvalues_wald(model_weekend_m3, exposure_weekend, "Model 3", "Weekend"),
+  get_rcs_pvalues_wald(model_weekend_m4, exposure_weekend, "Model 4", "Weekend")
+)
+
+write.csv(
+  rcs_pvalues_all_models,
+  file.path(out_dir, "Step16_RCS_P_values_all_models_weighted.csv"),
+  row.names = FALSE
+)
+
+cat("\nWeighted RCS P values for all models:\n")
+print(rcs_pvalues_all_models)
+
+# ==============================================================================
+# 19. Association of onset total score with depression
+# ==============================================================================
+
+design_scored <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = nhanes_scored,
+  nest = TRUE
+)
+
+score_model <- svyglm(
+  Moderate_depression_above ~ sleep_onset_total_score +
+    RIDAGEYR + sex + race_ethnicity +
+    education + marital_status + smoke_label +
+    BMI_value + AlcoholCategory + diabetes_label +
+    hypertension_label + work_status_label +
+    MET_total + INDFMPIR + sedentary_min,
+  design = design_scored,
+  family = quasibinomial()
+)
+
+score_res <- summary(score_model)$coefficients
+
+score_result <- data.frame(
+  term = "sleep_onset_total_score",
+  beta = score_res["sleep_onset_total_score", "Estimate"],
+  se = score_res["sleep_onset_total_score", "Std. Error"],
+  OR = exp(score_res["sleep_onset_total_score", "Estimate"]),
+  lower95 = exp(score_res["sleep_onset_total_score", "Estimate"] -
+                  1.96 * score_res["sleep_onset_total_score", "Std. Error"]),
+  upper95 = exp(score_res["sleep_onset_total_score", "Estimate"] +
+                  1.96 * score_res["sleep_onset_total_score", "Std. Error"]),
+  p_value = score_res["sleep_onset_total_score", "Pr(>|t|)"]
+)
+
+write.csv(
+  score_result,
+  file.path(out_dir, "Step16_onset_total_score_OR.csv"),
+  row.names = FALSE
+)
+
+print(score_result)
+
+# ==============================================================================
+# 20. Final publication-ready P value table
+# ==============================================================================
+
+format_p <- function(p) {
+  
+  if (is.na(p)) {
+    return(NA_character_)
+  }
+  
+  if (p < 0.001) {
+    return("<0.001")
+  }
+  
+  sprintf("%.3f", round(p, 3))
+}
+
+pvalue_table <- rcs_pvalues_all_models %>%
+  dplyr::select(
+    model,
+    timing,
+    overall_p,
+    nonlinear_p
+  ) %>%
+  dplyr::mutate(
+    overall_p_fmt = sapply(overall_p, format_p),
+    nonlinear_p_fmt = sapply(nonlinear_p, format_p)
+  ) %>%
+  dplyr::select(
+    Model = model,
+    Timing = timing,
+    `Overall P` = overall_p_fmt,
+    `Nonlinear P` = nonlinear_p_fmt
+  )
+
+score_table <- tibble::tibble(
+  Model = "Model 4",
+  Timing = "Onset total score",
+  `Overall P` = format_p(score_result$p_value),
+  `Nonlinear P` = "-"
+)
+
+final_p_table <- dplyr::bind_rows(
+  pvalue_table,
+  score_table
+)
+
+cat("\n====================================================\n")
+cat("FINAL WEIGHTED RCS P VALUE TABLE\n")
+cat("====================================================\n")
+
+print(final_p_table)
+
+write.csv(
+  final_p_table,
+  file.path(out_dir, "Step16_Final_Pvalue_Table.csv"),
+  row.names = FALSE
+)
+
+capture.output(
+  print(final_p_table),
+  file = file.path(out_dir, "Step16_Final_Pvalue_Table.txt")
+)
+
+cat("\nSaved:\n")
+cat(file.path(out_dir, "Step16_Final_Pvalue_Table.csv"), "\n")
+cat(file.path(out_dir, "Step16_Final_Pvalue_Table.txt"), "\n")
