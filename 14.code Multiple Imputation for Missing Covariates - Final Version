@@ -1,0 +1,709 @@
+################################################################################
+# SCRIPT: 14. Multiple Imputation for Missing Covariates - Final Version
+# STUDY: NHANES 2017-2023 Sleep Timing / Depression
+#
+# Purpose:
+#   Create multiply imputed datasets for primary association analyses.
+#
+# Key principles:
+#   - Do NOT impute outcomes
+#   - Do NOT impute core sleep exposures
+#   - Do NOT impute survey design variables or weights
+#   - Only impute missing covariates
+#   - Fully observed covariates are retained as predictors but not imputed
+#
+# Input:
+#   D:/code/12.Dataset_MI_Eligible.rds
+#
+# Outputs:
+#   D:/code/14.MI_mids_object.rds
+#   D:/code/14.MI_long_completed_data.rds
+#   D:/code/14.MI_completed_data_list.rds
+#   D:/code/14.MI_survey_design_list.rds
+#
+# QC outputs:
+#   D:/code/qc_outputs/Step14_MI_missingness_before.csv
+#   D:/code/qc_outputs/Step14_MI_missingness_after.csv
+#   D:/code/qc_outputs/Step14_MI_method_table.csv
+#   D:/code/qc_outputs/Step14_MI_logged_events.csv
+#   D:/code/qc_outputs/Step14_MI_traceplot.pdf
+#   D:/code/qc_outputs/Step14_MI_densityplot.pdf
+#   D:/code/qc_outputs/Step14_MI_stripplot.pdf
+################################################################################
+
+# 1. Libraries -----------------------------------------------------------------
+
+library(tidyverse)
+library(mice)
+library(survey)
+
+options(survey.lonely.psu = "adjust")
+
+# 2. Environment ---------------------------------------------------------------
+
+base_path <- "D:/code"
+setwd(base_path)
+
+qc_dir <- file.path(base_path, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 3. Load MI-eligible dataset --------------------------------------------------
+
+df0 <- readRDS("12.Dataset_MI_Eligible.rds")
+
+cat("Loaded MI-eligible dataset:\n")
+cat("N =", nrow(df0), "\n")
+cat("Variables =", ncol(df0), "\n\n")
+
+# 4. Define variable sets ------------------------------------------------------
+
+id_vars <- c(
+  "SEQN"
+)
+
+design_vars <- c(
+  "SDMVPSU",
+  "SDMVSTRA",
+  "mec_adj",
+  "int_adj"
+)
+
+outcome_vars <- c(
+  "PHQ9_SCORE",
+  "PHQ9_depression_above_10",
+  "Moderate_depression_above",
+  "PHQ9_depression_above_15",
+  "ModSevere_depression_above",
+  "PHQ9_no_sleep_SCORE",
+  "PHQ9_no_sleep_depression_above_10",
+  "PHQ9_no_sleep_depression_above_9",
+  "suicidal_ideation_daily"
+)
+
+sleep_vars <- c(
+  "sleep_onset_wd_min",
+  "wake_time_wd_min",
+  "midpoint_wd_min",
+  
+  "sleep_onset_we_min",
+  "wake_time_we_min",
+  "midpoint_we_min",
+  
+  "sleep_onset_wd_hour",
+  "wake_time_wd_hour",
+  "midpoint_wd_hour",
+  
+  "sleep_onset_we_hour",
+  "wake_time_we_hour",
+  "midpoint_we_hour",
+  
+  "dur_wd",
+  "dur_we",
+  "dur_wd_cat",
+  "dur_we_cat",
+  "dur_wd_cat_num",
+  "dur_we_cat_num"
+)
+
+# Continuous covariates requiring imputation
+impute_continuous <- c(
+  "INDFMPIR",
+  "BMI_value",
+  "MET_total",
+  "sedentary_min"
+)
+
+# Binary covariates requiring imputation
+# Fully observed variables such as sex are NOT listed here.
+impute_binary <- c(
+  "diabetes_or_prediabetes",
+  "htn_status",
+  "work_status"
+)
+
+# Multicategory covariates requiring imputation
+# Fully observed race/ethnicity is retained as predictor but not imputed.
+impute_multiclass <- c(
+  "education",
+  "marital_status",
+  "smoke_status",
+  "Alcohol_Status"
+)
+
+# Fully observed covariates retained as predictors but not imputed
+complete_covariates <- c(
+  "RIDAGEYR",
+  "sex",
+  "race_ethnicity"
+)
+
+mi_vars <- unique(c(
+  id_vars,
+  design_vars,
+  outcome_vars,
+  sleep_vars,
+  complete_covariates,
+  impute_continuous,
+  impute_binary,
+  impute_multiclass
+))
+
+missing_vars <- setdiff(mi_vars, names(df0))
+
+if (length(missing_vars) > 0) {
+  stop(
+    "These required variables are missing from df0: ",
+    paste(missing_vars, collapse = ", ")
+  )
+}
+
+df_mi <- df0 %>%
+  select(all_of(mi_vars))
+
+# 5. Prepare variable types for mice ------------------------------------------
+
+df_mi <- df_mi %>%
+  mutate(
+    SEQN = as.numeric(SEQN),
+    
+    SDMVPSU = factor(SDMVPSU),
+    SDMVSTRA = factor(SDMVSTRA),
+    
+    PHQ9_depression_above_10 = factor(
+      PHQ9_depression_above_10,
+      levels = c(0, 1)
+    ),
+    
+    Moderate_depression_above = factor(
+      Moderate_depression_above,
+      levels = c(0, 1)
+    ),
+    
+    PHQ9_depression_above_15 = factor(
+      PHQ9_depression_above_15,
+      levels = c(0, 1)
+    ),
+    
+    ModSevere_depression_above = factor(
+      ModSevere_depression_above,
+      levels = c(0, 1)
+    ),
+    
+    PHQ9_no_sleep_depression_above_10 = factor(
+      PHQ9_no_sleep_depression_above_10,
+      levels = c(0, 1)
+    ),
+    
+    PHQ9_no_sleep_depression_above_9 = factor(
+      PHQ9_no_sleep_depression_above_9,
+      levels = c(0, 1)
+    ),
+    
+    suicidal_ideation_daily = factor(
+      suicidal_ideation_daily,
+      levels = c(0, 1)
+    ),
+    
+    dur_wd_cat = factor(
+      dur_wd_cat,
+      levels = c("7-9 hours", "<7 hours", "≥9 hours")
+    ),
+    
+    dur_we_cat = factor(
+      dur_we_cat,
+      levels = c("7-9 hours", "<7 hours", "≥9 hours")
+    ),
+    
+    sex = factor(sex),
+    
+    race_ethnicity = factor(race_ethnicity),
+    
+    education = factor(education),
+    
+    marital_status = factor(marital_status),
+    
+    smoke_status = factor(
+      smoke_status,
+      levels = c(0, 1, 2),
+      labels = c("Never", "Former", "Current")
+    ),
+    
+    Alcohol_Status = factor(
+      Alcohol_Status,
+      levels = c(0, 1, 2),
+      labels = c("Never", "Non-heavy ever drinker", "Heavy")
+    ),
+    
+    diabetes_or_prediabetes = factor(
+      diabetes_or_prediabetes,
+      levels = c(0, 1),
+      labels = c("No", "Diabetes/prediabetes")
+    ),
+    
+    htn_status = factor(
+      htn_status,
+      levels = c(0, 1),
+      labels = c("No", "Yes")
+    ),
+    
+    work_status = factor(
+      work_status,
+      levels = c(0, 1),
+      labels = c("Employed/with job", "Not currently working")
+    )
+  )
+
+# 6. Missingness before imputation --------------------------------------------
+
+missing_before <- tibble(
+  Variable = names(df_mi),
+  Missing_n = map_int(
+    names(df_mi),
+    ~ sum(is.na(df_mi[[.x]]))
+  ),
+  Total_N = nrow(df_mi),
+  Missing_percent = round(
+    100 * Missing_n / Total_N,
+    2
+  )
+) %>%
+  arrange(desc(Missing_percent), Variable)
+
+cat("\n--- Missingness before imputation ---\n")
+print(
+  missing_before %>%
+    filter(Missing_n > 0)
+)
+
+write.csv(
+  missing_before,
+  file.path(qc_dir, "Step14_MI_missingness_before.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# 7. Configure mice ------------------------------------------------------------
+
+ini <- mice(
+  df_mi,
+  maxit = 0,
+  printFlag = FALSE
+)
+
+meth <- ini$method
+pred <- ini$predictorMatrix
+
+# Variables that should not be imputed
+no_impute_vars <- unique(c(
+  id_vars,
+  design_vars,
+  outcome_vars,
+  sleep_vars,
+  complete_covariates
+))
+
+# Clear all methods first
+meth[] <- ""
+
+# Assign imputation methods only to variables with missingness
+meth[impute_continuous] <- "pmm"
+meth[impute_binary] <- "logreg"
+meth[impute_multiclass] <- "polyreg"
+
+# Ensure variables without missingness are not assigned methods
+observed_missing_n <- map_int(
+  names(df_mi),
+  ~ sum(is.na(df_mi[[.x]]))
+)
+
+names(observed_missing_n) <- names(df_mi)
+
+meth[observed_missing_n == 0] <- ""
+
+# Explicitly enforce no-imputation variables
+meth[no_impute_vars] <- ""
+
+# Predictor matrix setup
+# Keep fully observed predictors available,
+# but do not use ID as predictor.
+pred[, "SEQN"] <- 0
+pred["SEQN", ] <- 0
+
+# Rows for non-imputed variables do not matter, but setting to 0 is cleaner.
+pred[no_impute_vars, ] <- 0
+
+# Avoid self-prediction
+diag(pred) <- 0
+
+# 8. Method table QC -----------------------------------------------------------
+
+method_table <- tibble(
+  Variable = names(meth),
+  Method = meth,
+  Missing_n = missing_before$Missing_n[
+    match(names(meth), missing_before$Variable)
+  ],
+  Missing_percent = missing_before$Missing_percent[
+    match(names(meth), missing_before$Variable)
+  ]
+)
+
+cat("\n--- Imputation method table ---\n")
+print(
+  method_table %>%
+    filter(Method != "" | Missing_n > 0)
+)
+
+write.csv(
+  method_table,
+  file.path(qc_dir, "Step14_MI_method_table.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# 9. Run multiple imputation ---------------------------------------------------
+
+set.seed(20260525)
+
+imp <- mice(
+  data = df_mi,
+  m = 20,
+  maxit = 20,
+  method = meth,
+  predictorMatrix = pred,
+  seed = 20260525,
+  printFlag = TRUE
+)
+
+saveRDS(
+  imp,
+  file.path(base_path, "14.MI_mids_object.rds")
+)
+
+cat("\nSaved mids object: D:/code/14.MI_mids_object.rds\n")
+
+# 10. Completed long-format data ----------------------------------------------
+
+mi_long <- complete(
+  imp,
+  action = "long",
+  include = FALSE
+)
+
+# 11. Derive post-imputation analysis variables --------------------------------
+
+derive_post_mi_vars <- function(data) {
+  
+  data %>%
+    mutate(
+      smoke_status_num = case_when(
+        smoke_status == "Never" ~ 0,
+        smoke_status == "Former" ~ 1,
+        smoke_status == "Current" ~ 2,
+        TRUE ~ NA_real_
+      ),
+      
+      Alcohol_Status_Num = case_when(
+        Alcohol_Status == "Never" ~ 0,
+        Alcohol_Status == "Non-heavy ever drinker" ~ 1,
+        Alcohol_Status == "Heavy" ~ 2,
+        TRUE ~ NA_real_
+      ),
+      
+      diabetes_or_prediabetes_num = case_when(
+        diabetes_or_prediabetes == "No" ~ 0,
+        diabetes_or_prediabetes == "Diabetes/prediabetes" ~ 1,
+        TRUE ~ NA_real_
+      ),
+      
+      htn_status_num = case_when(
+        htn_status == "No" ~ 0,
+        htn_status == "Yes" ~ 1,
+        TRUE ~ NA_real_
+      ),
+      
+      work_status_num = case_when(
+        work_status == "Employed/with job" ~ 0,
+        work_status == "Not currently working" ~ 1,
+        TRUE ~ NA_real_
+      ),
+      
+      Age_cat = case_when(
+        RIDAGEYR < 40 ~ "18-39 years",
+        RIDAGEYR >= 40 & RIDAGEYR < 60 ~ "40-59 years",
+        RIDAGEYR >= 60 ~ "≥60 years",
+        TRUE ~ NA_character_
+      ),
+      
+      Age_cat = factor(
+        Age_cat,
+        levels = c("18-39 years", "40-59 years", "≥60 years")
+      ),
+      
+      Age_cat_num = as.numeric(Age_cat),
+      
+      PIR_cat = case_when(
+        INDFMPIR < 1.30 ~ "<1.30",
+        INDFMPIR >= 1.30 & INDFMPIR < 3.50 ~ "1.30-3.49",
+        INDFMPIR >= 3.50 ~ "≥3.50",
+        TRUE ~ NA_character_
+      ),
+      
+      PIR_cat = factor(
+        PIR_cat,
+        levels = c("<1.30", "1.30-3.49", "≥3.50")
+      ),
+      
+      PIR_cat_num = as.numeric(PIR_cat),
+      
+      BMI_cat = case_when(
+        BMI_value < 18.5 ~ "Underweight",
+        BMI_value >= 18.5 & BMI_value < 25 ~ "Normal",
+        BMI_value >= 25 & BMI_value < 30 ~ "Overweight",
+        BMI_value >= 30 ~ "Obese",
+        TRUE ~ NA_character_
+      ),
+      
+      BMI_cat = factor(
+        BMI_cat,
+        levels = c(
+          "Underweight",
+          "Normal",
+          "Overweight",
+          "Obese"
+        )
+      ),
+      
+      BMI_cat_ordinal = as.numeric(BMI_cat),
+      
+      MET_cat_label = case_when(
+        MET_total < 600 ~ "Low",
+        MET_total >= 600 & MET_total <= 3000 ~ "Moderate",
+        MET_total > 3000 ~ "High",
+        TRUE ~ NA_character_
+      ),
+      
+      MET_cat_label = factor(
+        MET_cat_label,
+        levels = c("Low", "Moderate", "High")
+      ),
+      
+      MET_cat_num = as.numeric(MET_cat_label),
+      
+      sedentary_cat_label = case_when(
+        sedentary_min < 360 ~ "<6h",
+        sedentary_min >= 360 & sedentary_min <= 480 ~ "6-8h",
+        sedentary_min > 480 ~ ">8h",
+        TRUE ~ NA_character_
+      ),
+      
+      sedentary_cat_label = factor(
+        sedentary_cat_label,
+        levels = c("<6h", "6-8h", ">8h")
+      ),
+      
+      sedentary_cat_num = as.numeric(sedentary_cat_label)
+    )
+}
+
+mi_long_analysis <- mi_long %>%
+  derive_post_mi_vars()
+
+# 12. Completed data list ------------------------------------------------------
+
+mi_completed_list <- split(
+  mi_long_analysis %>%
+    select(-.id),
+  mi_long_analysis$.imp
+)
+
+mi_completed_list <- lapply(
+  mi_completed_list,
+  function(dat) {
+    dat %>%
+      mutate(
+        SDMVPSU = as.numeric(as.character(SDMVPSU)),
+        SDMVSTRA = as.numeric(as.character(SDMVSTRA))
+      )
+  }
+)
+
+saveRDS(
+  mi_long_analysis,
+  file.path(base_path, "14.MI_long_completed_data.rds")
+)
+
+saveRDS(
+  mi_completed_list,
+  file.path(base_path, "14.MI_completed_data_list.rds")
+)
+
+cat("\nSaved long completed data: D:/code/14.MI_long_completed_data.rds\n")
+cat("Saved completed data list: D:/code/14.MI_completed_data_list.rds\n")
+
+# 13. Missingness after imputation --------------------------------------------
+
+analysis_vars_after <- c(
+  outcome_vars,
+  sleep_vars,
+  design_vars,
+  complete_covariates,
+  impute_continuous,
+  impute_binary,
+  impute_multiclass,
+  "Age_cat",
+  "PIR_cat",
+  "BMI_cat",
+  "MET_cat_label",
+  "sedentary_cat_label"
+)
+
+missing_after <- mi_long_analysis %>%
+  group_by(.imp) %>%
+  summarise(
+    across(
+      all_of(analysis_vars_after),
+      ~ sum(is.na(.x))
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = -.imp,
+    names_to = "Variable",
+    values_to = "Missing_n"
+  ) %>%
+  group_by(Variable) %>%
+  summarise(
+    Max_missing_across_imputations = max(Missing_n),
+    Min_missing_across_imputations = min(Missing_n),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Max_missing_across_imputations), Variable)
+
+cat("\n--- Missingness after imputation ---\n")
+print(missing_after)
+
+write.csv(
+  missing_after,
+  file.path(qc_dir, "Step14_MI_missingness_after.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# 14. Survey design list -------------------------------------------------------
+
+mi_design_list <- lapply(
+  mi_completed_list,
+  function(dat) {
+    svydesign(
+      id = ~SDMVPSU,
+      strata = ~SDMVSTRA,
+      weights = ~mec_adj,
+      nest = TRUE,
+      data = dat
+    )
+  }
+)
+
+saveRDS(
+  mi_design_list,
+  file.path(base_path, "14.MI_survey_design_list.rds")
+)
+
+cat("\nSaved survey design list: D:/code/14.MI_survey_design_list.rds\n")
+
+# 15. Diagnostics --------------------------------------------------------------
+
+cat("\nGenerating MICE diagnostics...\n")
+
+# Trace plot
+pdf(
+  file.path(qc_dir, "Step14_MI_traceplot.pdf"),
+  width = 10,
+  height = 8
+)
+
+plot(imp)
+
+dev.off()
+
+# Density plot for continuous imputed variables
+pdf(
+  file.path(qc_dir, "Step14_MI_densityplot.pdf"),
+  width = 10,
+  height = 8
+)
+
+densityplot(
+  imp,
+  ~ INDFMPIR + BMI_value + MET_total + sedentary_min
+)
+
+dev.off()
+
+# Strip plot
+pdf(
+  file.path(qc_dir, "Step14_MI_stripplot.pdf"),
+  width = 10,
+  height = 8
+)
+
+stripplot(
+  imp,
+  pch = 20,
+  cex = 0.7
+)
+
+dev.off()
+
+# Logged events
+if (!is.null(imp$loggedEvents)) {
+  
+  write.csv(
+    imp$loggedEvents,
+    file.path(qc_dir, "Step14_MI_logged_events.csv"),
+    row.names = FALSE,
+    fileEncoding = "UTF-8"
+  )
+  
+  cat("Logged events exported: Step14_MI_logged_events.csv\n")
+  
+} else {
+  
+  cat("No logged events detected.\n")
+}
+
+# 16. Final QC summary ---------------------------------------------------------
+
+cat("\n--- FINAL MI QC SUMMARY ---\n")
+cat("MI eligible N:", nrow(df_mi), "\n")
+cat("Number of imputations:", imp$m, "\n")
+cat("Number of iterations:", imp$iteration, "\n")
+cat(
+  "Variables formally imputed:",
+  sum(method_table$Method != ""),
+  "\n"
+)
+cat(
+  "Variables with remaining missingness after MI:",
+  sum(missing_after$Max_missing_across_imputations > 0),
+  "\n"
+)
+
+cat("\nFiles generated:\n")
+cat("1) 14.MI_mids_object.rds\n")
+cat("2) 14.MI_long_completed_data.rds\n")
+cat("3) 14.MI_completed_data_list.rds\n")
+cat("4) 14.MI_survey_design_list.rds\n")
+cat("5) Step14_MI_missingness_before.csv\n")
+cat("6) Step14_MI_missingness_after.csv\n")
+cat("7) Step14_MI_method_table.csv\n")
+cat("8) Step14_MI_logged_events.csv\n")
+cat("9) Step14_MI_traceplot.pdf\n")
+cat("10) Step14_MI_densityplot.pdf\n")
+cat("11) Step14_MI_stripplot.pdf\n")
+
+cat("\nMultiple imputation completed successfully.\n")
