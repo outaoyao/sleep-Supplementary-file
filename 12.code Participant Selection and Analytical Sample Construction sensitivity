@@ -1,0 +1,725 @@
+################################################################################
+# SCRIPT: 12. Participant Selection for MI and Complete-Case Analyses
+# STUDY: Sleep Rhythm / Circadian Misalignment and Depressive Symptoms
+# DATA: NHANES 2017-March 2020 + 2021-2023
+#
+# Strategy:
+#   Primary analysis:
+#     - Keep participants with complete PHQ-9 outcome, sleep exposures,
+#       survey design variables, and positive MEC weight.
+#     - Exclude pregnant participants.
+#     - Do NOT drop participants with missing covariates.
+#     - Missing covariates will be handled by multiple imputation later.
+#
+#   Sensitivity analysis:
+#     - Complete-case dataset using all main covariates.
+#
+# Input:
+#   - D:/code/11.Dataset.rds
+#
+# Outputs:
+#   - D:/code/12.Dataset_MI_Eligible.rds
+#   - D:/code/12.Dataset_CompleteCase.rds
+#   - D:/code/12.Dataset.rds  [alias of complete-case dataset for compatibility]
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+
+library(tidyverse)
+library(tidyr)
+
+base_path <- "D:/code"
+setwd(base_path)
+
+qc_dir <- file.path(base_path, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 2. Helper Functions ----------------------------------------------------------
+
+check_required_vars <- function(data, vars, label) {
+  missing_vars <- setdiff(vars, names(data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required variables for ",
+      label,
+      ": ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  invisible(TRUE)
+}
+
+count_missing_by_var <- function(data, vars) {
+  data %>%
+    summarise(
+      across(
+        all_of(vars),
+        ~ sum(is.na(.x))
+      )
+    ) %>%
+    pivot_longer(
+      everything(),
+      names_to = "Variable",
+      values_to = "N_Missing"
+    ) %>%
+    arrange(desc(N_Missing), Variable)
+}
+
+# 3. Data Loading --------------------------------------------------------------
+
+cat("Loading consolidated NHANES master dataset...\n")
+
+df_raw <- readRDS("11.Dataset.rds")
+initial_n <- nrow(df_raw)
+
+cat("Initial master dataset N:", initial_n, "\n")
+
+# 4. Define Variables ----------------------------------------------------------
+
+# Primary outcome variables: required complete
+outcome_vars <- c(
+  "PHQ9_SCORE",
+  "PHQ9_depression_above_10",
+  "Moderate_depression_above"
+)
+
+# Sensitivity outcome variables: retained, not required for MI eligibility
+sensitivity_outcome_vars <- c(
+  "PHQ9_depression_above_15",
+  "ModSevere_depression_above",
+  "PHQ9_no_sleep_SCORE",
+  "PHQ9_no_sleep_depression_above_10",
+  "PHQ9_no_sleep_depression_above_9",
+  "suicidal_ideation_daily"
+)
+
+# Core exposure variables: required complete
+sleep_vars <- c(
+  "sleep_onset_wd_min",
+  "wake_time_wd_min",
+  "midpoint_wd_min",
+  
+  "sleep_onset_we_min",
+  "wake_time_we_min",
+  "midpoint_we_min",
+  
+  "sleep_onset_wd_hour",
+  "wake_time_wd_hour",
+  "midpoint_wd_hour",
+  
+  "sleep_onset_we_hour",
+  "wake_time_we_hour",
+  "midpoint_we_hour",
+  
+  "dur_wd",
+  "dur_we",
+  "dur_wd_cat",
+  "dur_we_cat",
+  "dur_wd_cat_num",
+  "dur_we_cat_num"
+)
+
+# Survey design variables: required complete
+design_vars <- c(
+  "SDMVPSU",
+  "SDMVSTRA",
+  "mec_adj",
+  "int_adj"
+)
+
+# Pregnancy exclusion variable
+pregnancy_var <- "RIDEXPRG"
+
+# Covariates allowed to be missing in MI-eligible dataset
+demographic_covariates <- c(
+  "RIDAGEYR",
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "INDFMPIR",
+  "PIR_cat",
+  "PIR_cat_num",
+  "Age_cat",
+  "Age_cat_num"
+)
+
+main_covariates <- c(
+  "BMI_value",
+  "BMI_cat",
+  "BMI_cat_ordinal",
+  
+  "smoke_status",
+  "smoke_status_label",
+  
+  "Alcohol_Status",
+  "Alcohol_Label",
+  
+  "diabetes_or_prediabetes",
+  "diabetes_or_prediabetes_label",
+  
+  "htn_status",
+  "htn_status_label",
+  
+  "work_status",
+  "work_status_label",
+  
+  "MET_total",
+  "MET_cat_label",
+  "MET_cat_num",
+  
+  "sedentary_min",
+  "sedentary_cat_label",
+  "sedentary_cat_num"
+)
+
+covariate_vars <- c(
+  demographic_covariates,
+  main_covariates
+)
+
+# Variables required for MI eligibility
+mi_required_complete_vars <- c(
+  outcome_vars,
+  sleep_vars,
+  design_vars,
+  pregnancy_var
+)
+
+all_required_vars <- unique(c(
+  mi_required_complete_vars,
+  sensitivity_outcome_vars,
+  covariate_vars
+))
+
+check_required_vars(
+  df_raw,
+  all_required_vars,
+  "MI eligible and complete-case participant selection"
+)
+
+# 5. Sequential Selection for MI-Eligible Dataset ------------------------------
+
+# Step 1: Complete primary PHQ-9 outcome
+df_step1 <- df_raw %>%
+  filter(
+    !is.na(PHQ9_SCORE),
+    !is.na(PHQ9_depression_above_10)
+  )
+
+n_after_phq <- nrow(df_step1)
+
+# Step 2: Valid survey design and positive MEC weight
+df_step2 <- df_step1 %>%
+  filter(
+    !is.na(SDMVPSU),
+    !is.na(SDMVSTRA),
+    !is.na(mec_adj),
+    mec_adj > 0
+  )
+
+n_after_design_weight <- nrow(df_step2)
+
+# Step 3: Complete core sleep exposure variables
+df_step3 <- df_step2 %>%
+  drop_na(all_of(sleep_vars))
+
+n_after_sleep <- nrow(df_step3)
+
+# Step 4: Exclude pregnant participants
+# RIDEXPRG == 1 indicates pregnant.
+# NA is retained because men and non-eligible participants can have missing RIDEXPRG.
+df_mi_eligible <- df_step3 %>%
+  filter(RIDEXPRG != 1 | is.na(RIDEXPRG))
+
+n_after_preg <- nrow(df_mi_eligible)
+
+# 6. Complete-Case Dataset for Sensitivity Analysis ----------------------------
+
+df_complete_case <- df_mi_eligible %>%
+  drop_na(all_of(covariate_vars))
+
+complete_case_n <- nrow(df_complete_case)
+
+# 7. Participant Flow Summary --------------------------------------------------
+
+selection_flow <- tibble(
+  Step = c(
+    "Initial NHANES 2017-2023 merged dataset",
+    "Completed PHQ-9 primary outcome",
+    "Valid MEC survey design and positive MEC weight",
+    "Completed core sleep timing and duration variables",
+    "Excluded pregnant individuals",
+    "MI-eligible analytical sample",
+    "Complete-case analytical sample"
+  ),
+  N = c(
+    initial_n,
+    n_after_phq,
+    n_after_design_weight,
+    n_after_sleep,
+    n_after_preg,
+    n_after_preg,
+    complete_case_n
+  ),
+  Excluded_from_previous_step = c(
+    0,
+    initial_n - n_after_phq,
+    n_after_phq - n_after_design_weight,
+    n_after_design_weight - n_after_sleep,
+    n_after_sleep - n_after_preg,
+    0,
+    n_after_preg - complete_case_n
+  )
+)
+
+cat("\n--- PARTICIPANT SELECTION FLOW ---\n")
+print(selection_flow)
+
+# 8. Missingness QC ------------------------------------------------------------
+
+cat("\n--- MI-ELIGIBLE DATASET: REQUIRED VARIABLE MISSINGNESS ---\n")
+
+mi_required_missing_check <- count_missing_by_var(
+  df_mi_eligible,
+  unique(c(outcome_vars, sleep_vars, design_vars))
+) %>%
+  filter(N_Missing > 0)
+
+if (nrow(mi_required_missing_check) == 0) {
+  cat("Success: No missing values in MI-required outcome/exposure/design variables.\n")
+} else {
+  print(mi_required_missing_check)
+}
+
+cat("\n--- MI-ELIGIBLE DATASET: COVARIATE MISSINGNESS FOR IMPUTATION ---\n")
+
+mi_covariate_missingness <- count_missing_by_var(
+  df_mi_eligible,
+  covariate_vars
+) %>%
+  mutate(
+    N_Total = nrow(df_mi_eligible),
+    Missing_Percent = round(100 * N_Missing / N_Total, 2)
+  )
+
+print(mi_covariate_missingness)
+
+cat("\n--- COMPLETE-CASE DATASET: MAIN ANALYSIS VARIABLE MISSINGNESS ---\n")
+
+complete_case_missing_check <- count_missing_by_var(
+  df_complete_case,
+  unique(c(outcome_vars, sleep_vars, design_vars, covariate_vars))
+) %>%
+  filter(N_Missing > 0)
+
+if (nrow(complete_case_missing_check) == 0) {
+  cat("Success: No missing values in complete-case analysis variables.\n")
+} else {
+  print(complete_case_missing_check)
+}
+
+# 9. Key Counts ----------------------------------------------------------------
+
+cat("\n--- KEY COUNTS ---\n")
+
+key_counts <- tibble(
+  dataset = c(
+    "MI-eligible",
+    "Complete-case"
+  ),
+  n = c(
+    nrow(df_mi_eligible),
+    nrow(df_complete_case)
+  ),
+  phq9_ge10_cases = c(
+    sum(df_mi_eligible$PHQ9_depression_above_10 == 1, na.rm = TRUE),
+    sum(df_complete_case$PHQ9_depression_above_10 == 1, na.rm = TRUE)
+  ),
+  phq9_ge15_cases = c(
+    sum(df_mi_eligible$PHQ9_depression_above_15 == 1, na.rm = TRUE),
+    sum(df_complete_case$PHQ9_depression_above_15 == 1, na.rm = TRUE)
+  ),
+  phq9_no_sleep_ge10_cases = c(
+    sum(df_mi_eligible$PHQ9_no_sleep_depression_above_10 == 1, na.rm = TRUE),
+    sum(df_complete_case$PHQ9_no_sleep_depression_above_10 == 1, na.rm = TRUE)
+  ),
+  phq9_no_sleep_ge9_cases = c(
+    sum(df_mi_eligible$PHQ9_no_sleep_depression_above_9 == 1, na.rm = TRUE),
+    sum(df_complete_case$PHQ9_no_sleep_depression_above_9 == 1, na.rm = TRUE)
+  ),
+  daily_suicidal_ideation_cases = c(
+    sum(df_mi_eligible$suicidal_ideation_daily == 1, na.rm = TRUE),
+    sum(df_complete_case$suicidal_ideation_daily == 1, na.rm = TRUE)
+  ),
+  pregnant_remaining = c(
+    sum(df_mi_eligible$RIDEXPRG == 1, na.rm = TRUE),
+    sum(df_complete_case$RIDEXPRG == 1, na.rm = TRUE)
+  ),
+  zero_or_negative_mec_weight_remaining = c(
+    sum(!is.na(df_mi_eligible$mec_adj) & df_mi_eligible$mec_adj <= 0),
+    sum(!is.na(df_complete_case$mec_adj) & df_complete_case$mec_adj <= 0)
+  )
+)
+
+print(key_counts)
+
+# 10. Save Outputs -------------------------------------------------------------
+
+saveRDS(
+  df_mi_eligible,
+  file.path(base_path, "12.Dataset_MI_Eligible.rds")
+)
+
+saveRDS(
+  df_complete_case,
+  file.path(base_path, "12.Dataset_CompleteCase.rds")
+)
+
+# Backward-compatible alias:
+# Keep 12.Dataset.rds as complete-case dataset unless later scripts are rewritten.
+saveRDS(
+  df_complete_case,
+  file.path(base_path, "12.Dataset.rds")
+)
+
+write_csv(
+  selection_flow,
+  file.path(qc_dir, "Step12_participant_selection_flow_MI_and_completecase.csv")
+)
+
+write_csv(
+  mi_covariate_missingness,
+  file.path(qc_dir, "Step12_MI_eligible_covariate_missingness_for_imputation.csv")
+)
+
+write_csv(
+  complete_case_missing_check,
+  file.path(qc_dir, "Step12_completecase_missingness_check.csv")
+)
+
+write_csv(
+  key_counts,
+  file.path(qc_dir, "Step12_key_counts_MI_and_completecase.csv")
+)
+
+cat("\nSaved MI-eligible dataset:",
+    file.path(base_path, "12.Dataset_MI_Eligible.rds"),
+    "\n")
+
+cat("Saved complete-case dataset:",
+    file.path(base_path, "12.Dataset_CompleteCase.rds"),
+    "\n")
+
+cat("Saved backward-compatible complete-case alias:",
+    file.path(base_path, "12.Dataset.rds"),
+    "\n")
+
+cat("QC files saved to:", qc_dir, "\n")
+
+################################################################################
+# STEP 12B — Publication-ready participant flowchart v3
+# Style: based on previous manuscript flowchart
+# Output: TIFF and PDF
+################################################################################
+
+library(tidyverse)
+library(ggplot2)
+library(grid)
+
+base_path <- "D:/code"
+fig_dir <- file.path(base_path, "figures")
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+# =============================================================================
+# Counts from Step 12 / Step 13
+# =============================================================================
+
+initial_n <- 27493
+
+n_after_phq <- 13731
+n_excl_phq <- 13762
+
+n_after_sleep <- 13454
+n_excl_sleep <- 277
+
+n_after_preg <- 13344
+n_excl_preg <- 110
+
+phq_lt10_n <- 11936
+phq_ge10_n <- 1408
+
+complete_case_n <- 9946
+n_excl_covariates <- n_after_preg - complete_case_n
+
+# =============================================================================
+# Helper: rounded rectangle
+# =============================================================================
+
+rounded_rect <- function(x, y, w, h, fill = "white", color = "black",
+                         linetype = "solid", linewidth = 0.5) {
+  annotate(
+    "rect",
+    xmin = x - w / 2,
+    xmax = x + w / 2,
+    ymin = y - h / 2,
+    ymax = y + h / 2,
+    fill = fill,
+    color = color,
+    linetype = linetype,
+    linewidth = linewidth
+  )
+}
+
+# =============================================================================
+# Box data
+# =============================================================================
+
+main_boxes <- tibble(
+  x = c(0, 0, 0, 0),
+  y = c(5.6, 4.35, 3.1, 1.85),
+  label = c(
+    paste0("Total participants in NHANES 2017–2023\nN = ", format(initial_n, big.mark = ",")),
+    paste0("Participants with complete PHQ-9 data\nN = ", format(n_after_phq, big.mark = ",")),
+    paste0("Participants with complete PHQ-9 and\ncore sleep variables\nN = ", format(n_after_sleep, big.mark = ",")),
+    paste0("Primary analytical sample\nMultiple imputation analyses\nN = ", format(n_after_preg, big.mark = ","))
+  ),
+  fill = c("white", "white", "white", "#EAF3FB")
+)
+
+exclusion_boxes <- tibble(
+  x = c(3.25, 3.25, 3.25),
+  y = c(5.6, 4.35, 3.1),
+  label = c(
+    paste0(
+      "Excluded: incomplete PHQ-9 data\n",
+      "n = ", format(n_excl_phq, big.mark = ","),
+      "\nIncludes participants <18 years"
+    ),
+    paste0(
+      "Excluded: missing core sleep\n",
+      "timing or duration variables\n",
+      "n = ", format(n_excl_sleep, big.mark = ",")
+    ),
+    paste0(
+      "Excluded: pregnancy\n",
+      "n = ", format(n_excl_preg, big.mark = ",")
+    )
+  )
+)
+
+bottom_boxes <- tibble(
+  x = c(-1.75, 1.75),
+  y = c(0.55, 0.55),
+  label = c(
+    paste0("PHQ-9 <10\nn = ", format(phq_lt10_n, big.mark = ",")),
+    paste0("PHQ-9 ≥10\nn = ", format(phq_ge10_n, big.mark = ","))
+  ),
+  fill = c("#EAF3FB", "#FFF1E6"),
+  color = c("#2B6CB0", "#D95F02")
+)
+
+cc_box <- tibble(
+  x = 3.25,
+  y = 1.85,
+  label = paste0(
+    "Complete-case dataset for\nexploratory spline analyses\nn = ",
+    format(complete_case_n, big.mark = ","),
+    "\nExcluded for missing covariates:\n",
+    "n = ", format(n_excl_covariates, big.mark = ",")
+  )
+)
+
+# =============================================================================
+# Plot
+# =============================================================================
+
+p_flow <- ggplot() +
+  
+  # Main flow boxes
+  geom_rect(
+    data = main_boxes,
+    aes(
+      xmin = x - 1.75,
+      xmax = x + 1.75,
+      ymin = y - 0.38,
+      ymax = y + 0.38,
+      fill = fill
+    ),
+    color = "black",
+    linewidth = 0.55,
+    show.legend = FALSE
+  ) +
+  scale_fill_identity() +
+  geom_text(
+    data = main_boxes,
+    aes(x = x, y = y, label = label),
+    size = 4.0,
+    lineheight = 0.95
+  ) +
+  
+  # Exclusion boxes
+  geom_rect(
+    data = exclusion_boxes,
+    aes(
+      xmin = x - 1.35,
+      xmax = x + 1.35,
+      ymin = y - 0.36,
+      ymax = y + 0.36
+    ),
+    fill = "white",
+    color = "grey35",
+    linetype = "dashed",
+    linewidth = 0.45
+  ) +
+  geom_text(
+    data = exclusion_boxes,
+    aes(x = x, y = y, label = label),
+    size = 3.45,
+    lineheight = 0.93
+  ) +
+  
+  # Complete-case side box
+  geom_rect(
+    data = cc_box,
+    aes(
+      xmin = x - 1.45,
+      xmax = x + 1.45,
+      ymin = y - 0.52,
+      ymax = y + 0.52
+    ),
+    fill = "white",
+    color = "grey35",
+    linetype = "dashed",
+    linewidth = 0.45
+  ) +
+  geom_text(
+    data = cc_box,
+    aes(x = x, y = y, label = label),
+    size = 3.25,
+    lineheight = 0.92
+  ) +
+  
+  # Bottom PHQ boxes
+  geom_rect(
+    data = bottom_boxes,
+    aes(
+      xmin = x - 1.25,
+      xmax = x + 1.25,
+      ymin = y - 0.34,
+      ymax = y + 0.34,
+      fill = fill,
+      color = color
+    ),
+    linewidth = 0.55,
+    show.legend = FALSE
+  ) +
+  scale_color_identity() +
+  geom_text(
+    data = bottom_boxes,
+    aes(x = x, y = y, label = label),
+    size = 3.75,
+    lineheight = 0.95
+  ) +
+  
+  # Vertical arrows
+  geom_segment(
+    aes(x = 0, xend = 0, y = 5.22, yend = 4.73),
+    arrow = arrow(length = unit(0.16, "cm")),
+    linewidth = 0.45
+  ) +
+  geom_segment(
+    aes(x = 0, xend = 0, y = 3.97, yend = 3.48),
+    arrow = arrow(length = unit(0.16, "cm")),
+    linewidth = 0.45
+  ) +
+  geom_segment(
+    aes(x = 0, xend = 0, y = 2.72, yend = 2.23),
+    arrow = arrow(length = unit(0.16, "cm")),
+    linewidth = 0.45
+  ) +
+  
+  # Split arrows to PHQ groups
+  geom_segment(
+    aes(x = 0, xend = -1.75, y = 1.47, yend = 0.90),
+    arrow = arrow(length = unit(0.16, "cm")),
+    linewidth = 0.45
+  ) +
+  geom_segment(
+    aes(x = 0, xend = 1.75, y = 1.47, yend = 0.90),
+    arrow = arrow(length = unit(0.16, "cm")),
+    linewidth = 0.45
+  ) +
+  
+  # Dashed exclusion arrows
+  geom_segment(
+    aes(x = 1.75, xend = 1.90, y = 5.6, yend = 5.6),
+    arrow = arrow(length = unit(0.13, "cm")),
+    color = "#D95F02",
+    linewidth = 0.45,
+    linetype = "dashed"
+  ) +
+  geom_segment(
+    aes(x = 1.75, xend = 1.90, y = 4.35, yend = 4.35),
+    arrow = arrow(length = unit(0.13, "cm")),
+    color = "#D95F02",
+    linewidth = 0.45,
+    linetype = "dashed"
+  ) +
+  geom_segment(
+    aes(x = 1.75, xend = 1.90, y = 3.1, yend = 3.1),
+    arrow = arrow(length = unit(0.13, "cm")),
+    color = "#D95F02",
+    linewidth = 0.45,
+    linetype = "dashed"
+  ) +
+  
+  # Dashed arrow from MI sample to complete-case side box
+  geom_segment(
+    aes(x = 1.75, xend = 1.80, y = 1.85, yend = 1.85),
+    arrow = arrow(length = unit(0.13, "cm")),
+    color = "grey35",
+    linewidth = 0.45,
+    linetype = "dashed"
+  ) +
+  
+  coord_cartesian(
+    xlim = c(-3.3, 4.85),
+    ylim = c(0.0, 6.15),
+    clip = "off"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+# =============================================================================
+# Save
+# =============================================================================
+
+ggsave(
+  filename = file.path(fig_dir, "Figure1_Participant_Flowchart.tiff"),
+  plot = p_flow,
+  width = 8.5,
+  height = 6.4,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Figure1_Participant_Flowchart.pdf"),
+  plot = p_flow,
+  width = 8.5,
+  height = 6.4,
+  units = "in"
+)
+
+cat("Figure 1 flowchart saved successfully:\n")
+cat(file.path(fig_dir, "Figure1_Participant_Flowchart.tiff"), "\n")
