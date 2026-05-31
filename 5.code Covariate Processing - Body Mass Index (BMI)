@@ -1,0 +1,286 @@
+################################################################################
+# Script Name: 5. Covariate Processing - Body Mass Index (BMI)
+# Purpose:
+#   Clean NHANES BMI data, perform anthropometric QC, and generate
+#   standard NIH/WHO BMI categories.
+#
+# Manuscript-consistent version:
+#   - Retain raw BMI values
+#   - Generate implausible-value QC flags
+#   - Do NOT delete participants
+#   - Implausible BMI values are treated as missing for analytic BMI
+#   - Standard NIH/WHO BMI categorization
+#
+# Data Cycles:
+#   - 2017-March 2020: P_BMX
+#   - 2021-2023: BMX_L
+#
+# Output:
+#   - D:/code/5.data.rds
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+
+library(nhanesA)
+library(tidyverse)
+
+export_dir <- "D:/code"
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = TRUE)
+}
+
+qc_dir <- file.path(export_dir, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 2. Helper Functions ----------------------------------------------------------
+
+clean_numeric <- function(x) {
+  suppressWarnings(as.numeric(x))
+}
+
+clean_bmi <- function(x,
+                      lower = 10,
+                      upper = 80) {
+  
+  case_when(
+    is.na(x) ~ NA_real_,
+    x < lower ~ NA_real_,
+    x > upper ~ NA_real_,
+    TRUE ~ x
+  )
+}
+
+# 3. Data Retrieval & Harmonization --------------------------------------------
+
+cat("Harmonizing BMI data across cycles...\n")
+
+process_bmi <- function(table_name, cycle_label) {
+  
+  raw_data <- nhanes(table_name)
+  
+  required_vars <- c("SEQN", "BMXBMI")
+  
+  missing_vars <- setdiff(required_vars, names(raw_data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required BMI variables in ",
+      table_name,
+      ": ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  processed <- raw_data %>%
+    as_tibble() %>%
+    select(all_of(required_vars)) %>%
+    mutate(
+      SEQN = clean_numeric(SEQN),
+      
+      BMI_raw = clean_numeric(BMXBMI),
+      
+      # Implausible-value QC flags
+      BMI_implausible_flag = case_when(
+        is.na(BMI_raw) ~ NA_real_,
+        BMI_raw < 10 ~ 1,
+        BMI_raw > 80 ~ 1,
+        TRUE ~ 0
+      ),
+      
+      # Analytic BMI variable
+      BMI_value = clean_bmi(
+        BMI_raw,
+        lower = 10,
+        upper = 80
+      ),
+      
+      CYCLE = cycle_label
+    )
+  
+  return(processed)
+}
+
+bmi_1720 <- process_bmi("P_BMX", "2017-2020")
+bmi_2123 <- process_bmi("BMX_L", "2021-2023")
+
+bmi_combined <- bind_rows(bmi_1720, bmi_2123)
+
+# 4. Clinical Categorization ---------------------------------------------------
+
+bmi_processed <- bmi_combined %>%
+  mutate(
+    
+    # Standard NIH / WHO BMI categories
+    BMI_cat = cut(
+      BMI_value,
+      breaks = c(-Inf, 18.5, 25, 30, Inf),
+      labels = c(
+        "Underweight",
+        "Normal",
+        "Overweight",
+        "Obese"
+      ),
+      right = FALSE
+    ),
+    
+    # Ordinal coding
+    BMI_cat_ordinal = as.integer(BMI_cat),
+    
+    # Detailed obesity subcategories
+    BMI_detailed = cut(
+      BMI_value,
+      breaks = c(-Inf, 18.5, 25, 30, 35, 40, Inf),
+      labels = c(
+        "Underweight",
+        "Normal",
+        "Overweight",
+        "Obesity Class I",
+        "Obesity Class II",
+        "Obesity Class III"
+      ),
+      right = FALSE
+    ),
+    
+    BMI_detailed_ordinal = as.integer(BMI_detailed)
+  ) %>%
+  select(
+    SEQN,
+    
+    BMI_raw,
+    BMI_implausible_flag,
+    
+    BMI_value,
+    
+    BMI_cat,
+    BMI_cat_ordinal,
+    
+    BMI_detailed,
+    BMI_detailed_ordinal,
+    
+    CYCLE
+  )
+
+# 5. Quality Control -----------------------------------------------------------
+
+cat("\n--- BMI Raw Value Statistics ---\n")
+print(summary(bmi_processed$BMI_raw))
+
+cat("\n--- BMI Analytic Value Statistics ---\n")
+print(summary(bmi_processed$BMI_value))
+
+cat("\n--- BMI Category Distribution ---\n")
+
+BMI_category_dist <- bmi_processed %>%
+  count(BMI_cat, name = "n")
+
+print(BMI_category_dist)
+
+cat("\n--- Detailed BMI Category Distribution ---\n")
+
+BMI_detailed_dist <- bmi_processed %>%
+  count(BMI_detailed, name = "n")
+
+print(BMI_detailed_dist)
+
+cat("\n--- Implausible BMI QC ---\n")
+
+BMI_implausible_qc <- bmi_processed %>%
+  summarise(
+    n_total = n(),
+    
+    missing_BMI_raw = sum(is.na(BMI_raw)),
+    missing_BMI_value = sum(is.na(BMI_value)),
+    
+    n_implausible_BMI =
+      sum(BMI_implausible_flag == 1, na.rm = TRUE),
+    
+    n_BMI_below_10 =
+      sum(BMI_raw < 10, na.rm = TRUE),
+    
+    n_BMI_above_80 =
+      sum(BMI_raw > 80, na.rm = TRUE),
+    
+    min_BMI_raw =
+      min(BMI_raw, na.rm = TRUE),
+    
+    max_BMI_raw =
+      max(BMI_raw, na.rm = TRUE),
+    
+    min_BMI_analytic =
+      min(BMI_value, na.rm = TRUE),
+    
+    max_BMI_analytic =
+      max(BMI_value, na.rm = TRUE)
+  )
+
+print(BMI_implausible_qc)
+
+cat("\n--- Cycle-specific BMI QC ---\n")
+
+BMI_cycle_qc <- bmi_processed %>%
+  group_by(CYCLE) %>%
+  summarise(
+    n_total = n(),
+    
+    missing_BMI_raw =
+      sum(is.na(BMI_raw)),
+    
+    missing_BMI_value =
+      sum(is.na(BMI_value)),
+    
+    n_implausible_BMI =
+      sum(BMI_implausible_flag == 1, na.rm = TRUE),
+    
+    mean_BMI =
+      mean(BMI_value, na.rm = TRUE),
+    
+    median_BMI =
+      median(BMI_value, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+print(BMI_cycle_qc)
+
+# 6. Save QC Outputs -----------------------------------------------------------
+
+write_csv(
+  BMI_category_dist,
+  file.path(qc_dir, "Step5_BMI_category_distribution.csv")
+)
+
+write_csv(
+  BMI_detailed_dist,
+  file.path(qc_dir, "Step5_BMI_detailed_distribution.csv")
+)
+
+write_csv(
+  BMI_implausible_qc,
+  file.path(qc_dir, "Step5_BMI_implausible_qc.csv")
+)
+
+write_csv(
+  BMI_cycle_qc,
+  file.path(qc_dir, "Step5_BMI_cycle_qc.csv")
+)
+
+# 7. Export --------------------------------------------------------------------
+
+save_path <- file.path(export_dir, "5.data.rds")
+
+saveRDS(bmi_processed, save_path)
+
+cat("\nBMI data successfully exported to:", save_path, "\n")
+cat("QC files saved to:", qc_dir, "\n")
+
+cat(
+  "Final Dataset dimensions:",
+  dim(bmi_processed)[1],
+  "rows and",
+  dim(bmi_processed)[2],
+  "variables.\n"
+)
