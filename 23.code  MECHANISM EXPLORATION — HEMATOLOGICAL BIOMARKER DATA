@@ -1,0 +1,1070 @@
+################################################################################
+# MECHANISM EXPLORATION — HEMATOLOGICAL BIOMARKER DATA
+# NHANES 2017-March 2020 + August 2021-August 2023
+#
+# Revised version:
+#   1. Preserve WTPH2YR separately from CBC_L / HSCRP_L / BIOPRO_L / TCHOL_L / HDL_L
+#   2. Construct panel-specific and coalesced phlebotomy weights
+#   3. Add hs-CRP BDL comment code: LBDHRPLC
+#   4. Add GGT upper-limit comment code: LBDSGTLC
+#   5. Do NOT pre-compute log_HSCRP or log_TG here
+#   6. Add panel-specific N, weight, fasting, and extreme-value QC outputs
+################################################################################
+
+rm(list = ls())
+
+library(nhanesA)
+library(dplyr)
+library(tidyr)
+library(readr)
+
+export_dir <- "D:/code"
+out_dir    <- file.path(export_dir, "Step_Mechanism_Hematology")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ==============================================================================
+# 0. Utility functions
+# ==============================================================================
+
+safe_nhanes <- function(table_name) {
+  cat("  Downloading:", table_name, "...")
+  tryCatch({
+    df <- nhanes(table_name)
+    cat(" OK (", nrow(df), "rows )\n")
+    as.data.frame(df)
+  }, error = function(e) {
+    cat(" FAILED:", conditionMessage(e), "\n")
+    NULL
+  })
+}
+
+select_existing <- function(df, vars) {
+  vars_found <- intersect(vars, names(df))
+  vars_miss  <- setdiff(vars, names(df))
+  
+  if (length(vars_miss) > 0) {
+    cat("    Missing variables ignored:",
+        paste(vars_miss, collapse = ", "), "\n")
+  }
+  
+  df[, vars_found, drop = FALSE]
+}
+
+drop_cycle <- function(df) {
+  dplyr::select(df, -any_of("CYCLE"))
+}
+
+safe_numeric <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  suppressWarnings(as.numeric(x))
+}
+
+safe_min <- function(x) {
+  x <- safe_numeric(x)
+  if (all(is.na(x))) return(NA_real_)
+  suppressWarnings(min(x, na.rm = TRUE))
+}
+
+safe_max <- function(x) {
+  x <- safe_numeric(x)
+  if (all(is.na(x))) return(NA_real_)
+  suppressWarnings(max(x, na.rm = TRUE))
+}
+
+safe_mean <- function(x) {
+  x <- safe_numeric(x)
+  if (all(is.na(x))) return(NA_real_)
+  suppressWarnings(mean(x, na.rm = TRUE))
+}
+
+# ==============================================================================
+# 1. COMPLETE BLOOD COUNT
+# ==============================================================================
+
+cat("\n── CBC ────────────────────────────────────────────────────\n")
+
+cbc_vars <- c(
+  "SEQN",
+  "LBXWBCSI",
+  "LBXLYPCT",
+  "LBXMOPCT",
+  "LBXNEPCT",
+  "LBXEOPCT",
+  "LBXBAPCT",
+  "LBDLYMNO",
+  "LBDMONO",
+  "LBDNENO",
+  "LBDEONO",
+  "LBDBANO",
+  "LBXRBCSI",
+  "LBXHGB",
+  "LBXHCT",
+  "LBXMCVSI",
+  "LBXMC",
+  "LBXMCHSI",
+  "LBXRDW",
+  "LBXPLTSI",
+  "LBXMPSI",
+  "LBXNRBC"
+)
+
+raw_cbc_1720 <- safe_nhanes("P_CBC")
+raw_cbc_2123 <- safe_nhanes("CBC_L")
+
+process_cbc <- function(df, cycle, weight_name = NULL) {
+  keep <- c(cbc_vars, weight_name)
+  df <- select_existing(df, keep)
+  df$SEQN  <- as.numeric(df$SEQN)
+  df$CYCLE <- cycle
+  df
+}
+
+cbc_1720 <- process_cbc(
+  raw_cbc_1720,
+  cycle = "2017-2020",
+  weight_name = NULL
+)
+
+cbc_2123 <- process_cbc(
+  raw_cbc_2123,
+  cycle = "2021-2023",
+  weight_name = "WTPH2YR"
+) %>%
+  rename(WTPH2YR_cbc = WTPH2YR)
+
+cbc_combined <- bind_rows(cbc_1720, cbc_2123)
+
+cat("CBC combined rows:", nrow(cbc_combined), "\n")
+
+# ==============================================================================
+# 2. HIGH-SENSITIVITY C-REACTIVE PROTEIN
+# ==============================================================================
+
+cat("\n── hs-CRP ─────────────────────────────────────────────────\n")
+
+raw_crp_1720 <- safe_nhanes("P_HSCRP")
+raw_crp_2123 <- safe_nhanes("HSCRP_L")
+
+crp_vars <- c(
+  "SEQN",
+  "LBXHSCRP",
+  "LBDHRPLC"   # hs-CRP comment code: below LLOD flag
+)
+
+process_crp <- function(df, cycle, weight_name = NULL) {
+  keep <- c(crp_vars, weight_name)
+  df <- select_existing(df, keep)
+  df$SEQN  <- as.numeric(df$SEQN)
+  df$CYCLE <- cycle
+  df
+}
+
+crp_1720 <- process_crp(
+  raw_crp_1720,
+  cycle = "2017-2020",
+  weight_name = NULL
+)
+
+crp_2123 <- process_crp(
+  raw_crp_2123,
+  cycle = "2021-2023",
+  weight_name = "WTPH2YR"
+) %>%
+  rename(WTPH2YR_crp = WTPH2YR)
+
+crp_combined <- bind_rows(crp_1720, crp_2123)
+
+cat("CRP combined rows:", nrow(crp_combined), "\n")
+
+# ==============================================================================
+# 3. STANDARD BIOCHEMISTRY PROFILE
+# ==============================================================================
+
+cat("\n── Standard Biochemistry Profile ──────────────────────────\n")
+
+biopro_vars <- c(
+  "SEQN",
+  "LBXSATSI",
+  "LBXSASSI",
+  "LBXSAPSI",
+  "LBXSGTSI",
+  "LBDSGTLC",   # GGT above-ULOD comment code
+  "LBXSTB",
+  "LBDSTBSI",
+  "LBXSAL",
+  "LBXSGB",
+  "LBXSTP",
+  "LBXSLDSI",
+  "LBXSCR",
+  "LBDSCRSI",
+  "LBXSBU",
+  "LBXSUA",
+  "LBXSGL",
+  "LBXSIR",
+  "LBXSKSI",
+  "LBXSNASI",
+  "LBXSCLSI",
+  "LBXSC3SI",
+  "LBXSCA",
+  "LBXSPH",
+  "LBXMAGN",
+  "LBXSOSSI",
+  "LBXSCK"
+)
+
+raw_biopro_1720 <- safe_nhanes("P_BIOPRO")
+raw_biopro_2123 <- safe_nhanes("BIOPRO_L")
+
+process_biopro <- function(df, cycle, weight_name = NULL) {
+  keep <- c(biopro_vars, weight_name)
+  df <- select_existing(df, keep)
+  df$SEQN  <- as.numeric(df$SEQN)
+  df$CYCLE <- cycle
+  df
+}
+
+biopro_1720 <- process_biopro(
+  raw_biopro_1720,
+  cycle = "2017-2020",
+  weight_name = NULL
+)
+
+biopro_2123 <- process_biopro(
+  raw_biopro_2123,
+  cycle = "2021-2023",
+  weight_name = "WTPH2YR"
+) %>%
+  rename(WTPH2YR_biopro = WTPH2YR)
+
+biopro_combined <- bind_rows(biopro_1720, biopro_2123)
+
+cat("BIOPRO combined rows:", nrow(biopro_combined), "\n")
+
+# ==============================================================================
+# 4. TOTAL CHOLESTEROL
+# ==============================================================================
+
+cat("\n── Total Cholesterol ──────────────────────────────────────\n")
+
+tchol_vars <- c(
+  "SEQN",
+  "LBXTC",
+  "LBDTCSI"
+)
+
+raw_tchol_1720 <- safe_nhanes("P_TCHOL")
+raw_tchol_2123 <- safe_nhanes("TCHOL_L")
+
+process_tchol <- function(df, cycle, weight_name = NULL) {
+  keep <- c(tchol_vars, weight_name)
+  df <- select_existing(df, keep)
+  df$SEQN  <- as.numeric(df$SEQN)
+  df$CYCLE <- cycle
+  df
+}
+
+tchol_1720 <- process_tchol(
+  raw_tchol_1720,
+  cycle = "2017-2020",
+  weight_name = NULL
+)
+
+tchol_2123 <- process_tchol(
+  raw_tchol_2123,
+  cycle = "2021-2023",
+  weight_name = "WTPH2YR"
+) %>%
+  rename(WTPH2YR_tchol = WTPH2YR)
+
+tchol_combined <- bind_rows(tchol_1720, tchol_2123)
+
+cat("TCHOL combined rows:", nrow(tchol_combined), "\n")
+
+# ==============================================================================
+# 5. HDL-CHOLESTEROL
+# ==============================================================================
+
+cat("\n── HDL-Cholesterol ────────────────────────────────────────\n")
+
+hdl_vars <- c(
+  "SEQN",
+  "LBDHDD",
+  "LBDHDDSI"
+)
+
+raw_hdl_1720 <- safe_nhanes("P_HDL")
+raw_hdl_2123 <- safe_nhanes("HDL_L")
+
+process_hdl <- function(df, cycle, weight_name = NULL) {
+  keep <- c(hdl_vars, weight_name)
+  df <- select_existing(df, keep)
+  df$SEQN  <- as.numeric(df$SEQN)
+  df$CYCLE <- cycle
+  df
+}
+
+hdl_1720 <- process_hdl(
+  raw_hdl_1720,
+  cycle = "2017-2020",
+  weight_name = NULL
+)
+
+hdl_2123 <- process_hdl(
+  raw_hdl_2123,
+  cycle = "2021-2023",
+  weight_name = "WTPH2YR"
+) %>%
+  rename(WTPH2YR_hdl = WTPH2YR)
+
+hdl_combined <- bind_rows(hdl_1720, hdl_2123)
+
+cat("HDL combined rows:", nrow(hdl_combined), "\n")
+
+# ==============================================================================
+# 6. LDL-CHOLESTEROL & TRIGLYCERIDES — FASTING SUBSAMPLE
+# ==============================================================================
+
+cat("\n── LDL & Triglycerides (fasting) ──────────────────────────\n")
+
+raw_trigly_1720 <- safe_nhanes("P_TRIGLY")
+raw_trigly_2123 <- safe_nhanes("TRIGLY_L")
+
+trigly_1720 <- raw_trigly_1720 %>%
+  select_existing(c(
+    "SEQN",
+    "WTSAFPRP",
+    "LBXTR",
+    "LBDTRSI",
+    "LBDLDL",
+    "LBDLDLSI",
+    "LBDLDLM",
+    "LBDLDMSI",
+    "LBDLDLN",
+    "LBDLDNSI"
+  )) %>%
+  rename(
+    TG_mgdL = LBXTR
+  ) %>%
+  mutate(
+    SEQN = as.numeric(SEQN),
+    CYCLE = "2017-2020"
+  )
+
+trigly_2123 <- raw_trigly_2123 %>%
+  select_existing(c(
+    "SEQN",
+    "WTSAF2YR",
+    "LBXTLG",
+    "LBDTRSI",
+    "LBDLDL",
+    "LBDLDLSI",
+    "LBDLDLM",
+    "LBDLDMSI",
+    "LBDLDLN",
+    "LBDLDNSI"
+  )) %>%
+  rename(
+    TG_mgdL = LBXTLG
+  ) %>%
+  mutate(
+    SEQN = as.numeric(SEQN),
+    CYCLE = "2021-2023"
+  )
+
+trigly_combined <- bind_rows(trigly_1720, trigly_2123)
+
+cat("TRIGLY combined rows:", nrow(trigly_combined), "\n")
+
+# ==============================================================================
+# 7. DEMOGRAPHICS
+# ==============================================================================
+
+cat("\n── Demographics ───────────────────────────────────────────\n")
+
+raw_demo_1720 <- safe_nhanes("P_DEMO")
+raw_demo_2123 <- safe_nhanes("DEMO_L")
+
+demo_vars <- c(
+  "SEQN",
+  "SDMVPSU",
+  "SDMVSTRA",
+  "RIDAGEYR",
+  "RIAGENDR",
+  "RIDRETH3"
+)
+
+demo_1720 <- raw_demo_1720 %>%
+  dplyr::select(all_of(c(demo_vars, "WTMECPRP"))) %>%
+  rename(wt_mec = WTMECPRP) %>%
+  mutate(
+    SEQN = as.numeric(SEQN),
+    CYCLE = "2017-2020"
+  )
+
+demo_2123 <- raw_demo_2123 %>%
+  dplyr::select(all_of(c(demo_vars, "WTMEC2YR"))) %>%
+  rename(wt_mec = WTMEC2YR) %>%
+  mutate(
+    SEQN = as.numeric(SEQN),
+    CYCLE = "2021-2023"
+  )
+
+demo_combined <- bind_rows(demo_1720, demo_2123)
+
+cat("DEMO combined rows:", nrow(demo_combined), "\n")
+
+# ==============================================================================
+# 8. MERGE ALL PANELS
+# ==============================================================================
+
+cat("\n── Merging all panels ──────────────────────────────────────\n")
+
+dat <- demo_combined %>%
+  left_join(drop_cycle(cbc_combined),    by = "SEQN") %>%
+  left_join(drop_cycle(crp_combined),    by = "SEQN") %>%
+  left_join(drop_cycle(biopro_combined), by = "SEQN") %>%
+  left_join(drop_cycle(tchol_combined),  by = "SEQN") %>%
+  left_join(drop_cycle(hdl_combined),    by = "SEQN") %>%
+  left_join(drop_cycle(trigly_combined), by = "SEQN")
+
+cat("Merged dataset rows:", nrow(dat), "\n")
+
+if (nrow(dat) != nrow(demo_combined)) {
+  stop("Row count changed after merge. Possible duplicated SEQN in at least one panel.")
+}
+# ==============================================================================
+# 8B. FORCE COMMENT CODES TO NUMERIC
+# ==============================================================================
+
+dat <- dat %>%
+  mutate(
+    LBDHRPLC = suppressWarnings(as.numeric(as.character(LBDHRPLC))),
+    LBDSGTLC = suppressWarnings(as.numeric(as.character(LBDSGTLC)))
+  )
+# ==============================================================================
+# 9. CONSTRUCT WEIGHTS
+# ==============================================================================
+
+cat("\n── Constructing sample weights ────────────────────────────\n")
+
+dat <- dat %>%
+  mutate(
+    # Panel-specific phlebotomy weights.
+    # 2017-2020 has no WTPH2YR, so WTMECPRP is used for all non-fasting labs.
+    wt_cbc = case_when(
+      CYCLE == "2017-2020" ~ wt_mec,
+      CYCLE == "2021-2023" ~ WTPH2YR_cbc,
+      TRUE ~ NA_real_
+    ),
+    wt_crp = case_when(
+      CYCLE == "2017-2020" ~ wt_mec,
+      CYCLE == "2021-2023" ~ WTPH2YR_crp,
+      TRUE ~ NA_real_
+    ),
+    wt_biopro = case_when(
+      CYCLE == "2017-2020" ~ wt_mec,
+      CYCLE == "2021-2023" ~ WTPH2YR_biopro,
+      TRUE ~ NA_real_
+    ),
+    wt_tchol = case_when(
+      CYCLE == "2017-2020" ~ wt_mec,
+      CYCLE == "2021-2023" ~ WTPH2YR_tchol,
+      TRUE ~ NA_real_
+    ),
+    wt_hdl = case_when(
+      CYCLE == "2017-2020" ~ wt_mec,
+      CYCLE == "2021-2023" ~ WTPH2YR_hdl,
+      TRUE ~ NA_real_
+    ),
+    
+    # Coalesced general phlebotomy weight for backward compatibility.
+    # Step 24 can still use this for general non-fasting biomarkers,
+    # but panel-specific weights are also provided for audit.
+    WTPH2YR_any = coalesce(
+      WTPH2YR_cbc,
+      WTPH2YR_crp,
+      WTPH2YR_biopro,
+      WTPH2YR_tchol,
+      WTPH2YR_hdl
+    ),
+    
+    wt_phlebotomy = case_when(
+      CYCLE == "2017-2020" ~ wt_mec,
+      CYCLE == "2021-2023" ~ WTPH2YR_any,
+      TRUE ~ NA_real_
+    ),
+    
+    wt_fasting = case_when(
+      CYCLE == "2017-2020" ~ WTSAFPRP,
+      CYCLE == "2021-2023" ~ WTSAF2YR,
+      TRUE ~ NA_real_
+    )
+  )
+
+# ==============================================================================
+# 10. DERIVED VARIABLES
+#     Do not compute log_HSCRP or log_TG here.
+#     Log-transforms should be generated after range cleaning in Step 24.
+# ==============================================================================
+
+cat("\n── Derived variables ──────────────────────────────────────\n")
+
+dat <- dat %>%
+  mutate(
+    NLR = ifelse(
+      !is.na(LBDLYMNO) & LBDLYMNO > 0,
+      LBDNENO / LBDLYMNO,
+      NA_real_
+    ),
+    PLR = ifelse(
+      !is.na(LBDLYMNO) & LBDLYMNO > 0,
+      LBXPLTSI / LBDLYMNO,
+      NA_real_
+    ),
+    AST_ALT_ratio = ifelse(
+      !is.na(LBXSATSI) & LBXSATSI > 0,
+      LBXSASSI / LBXSATSI,
+      NA_real_
+    ),
+    non_HDL_chol = ifelse(
+      !is.na(LBXTC) & !is.na(LBDHDD),
+      LBXTC - LBDHDD,
+      NA_real_
+    ),
+    TC_HDL_ratio = ifelse(
+      !is.na(LBXTC) & !is.na(LBDHDD) & LBDHDD > 0,
+      LBXTC / LBDHDD,
+      NA_real_
+    )
+  )
+
+# ==============================================================================
+# 11. QC OUTPUTS
+# ==============================================================================
+
+cat("\n── QC checks ───────────────────────────────────────────────\n")
+
+# ------------------------------------------------------------------------------
+# 11.1 Panel-specific N
+# ------------------------------------------------------------------------------
+
+panel_n_qc <- bind_rows(
+  data.frame(
+    panel = "DEMO",
+    n_rows = nrow(demo_combined),
+    n_unique_seqn = n_distinct(demo_combined$SEQN)
+  ),
+  data.frame(
+    panel = "CBC",
+    n_rows = nrow(cbc_combined),
+    n_unique_seqn = n_distinct(cbc_combined$SEQN)
+  ),
+  data.frame(
+    panel = "hsCRP",
+    n_rows = nrow(crp_combined),
+    n_unique_seqn = n_distinct(crp_combined$SEQN)
+  ),
+  data.frame(
+    panel = "BIOPRO",
+    n_rows = nrow(biopro_combined),
+    n_unique_seqn = n_distinct(biopro_combined$SEQN)
+  ),
+  data.frame(
+    panel = "TCHOL",
+    n_rows = nrow(tchol_combined),
+    n_unique_seqn = n_distinct(tchol_combined$SEQN)
+  ),
+  data.frame(
+    panel = "HDL",
+    n_rows = nrow(hdl_combined),
+    n_unique_seqn = n_distinct(hdl_combined$SEQN)
+  ),
+  data.frame(
+    panel = "TRIGLY_fasting",
+    n_rows = nrow(trigly_combined),
+    n_unique_seqn = n_distinct(trigly_combined$SEQN)
+  )
+) %>%
+  mutate(
+    pct_of_demo = round(n_unique_seqn / nrow(demo_combined) * 100, 2)
+  )
+
+write.csv(
+  panel_n_qc,
+  file.path(out_dir, "Mechanism_Hematology_QC_panel_specific_N.csv"),
+  row.names = FALSE
+)
+
+cat("\nPanel-specific N:\n")
+print(panel_n_qc)
+
+# ------------------------------------------------------------------------------
+# 11.2 Weight QC
+# ------------------------------------------------------------------------------
+
+wt_summary <- dat %>%
+  group_by(CYCLE) %>%
+  summarise(
+    n_total = n(),
+    
+    n_wt_cbc_positive      = sum(wt_cbc > 0, na.rm = TRUE),
+    n_wt_cbc_zero          = sum(wt_cbc == 0, na.rm = TRUE),
+    n_wt_cbc_na            = sum(is.na(wt_cbc)),
+    
+    n_wt_crp_positive      = sum(wt_crp > 0, na.rm = TRUE),
+    n_wt_crp_zero          = sum(wt_crp == 0, na.rm = TRUE),
+    n_wt_crp_na            = sum(is.na(wt_crp)),
+    
+    n_wt_biopro_positive   = sum(wt_biopro > 0, na.rm = TRUE),
+    n_wt_biopro_zero       = sum(wt_biopro == 0, na.rm = TRUE),
+    n_wt_biopro_na         = sum(is.na(wt_biopro)),
+    
+    n_wt_tchol_positive    = sum(wt_tchol > 0, na.rm = TRUE),
+    n_wt_tchol_zero        = sum(wt_tchol == 0, na.rm = TRUE),
+    n_wt_tchol_na          = sum(is.na(wt_tchol)),
+    
+    n_wt_hdl_positive      = sum(wt_hdl > 0, na.rm = TRUE),
+    n_wt_hdl_zero          = sum(wt_hdl == 0, na.rm = TRUE),
+    n_wt_hdl_na            = sum(is.na(wt_hdl)),
+    
+    n_wt_phleb_positive    = sum(wt_phlebotomy > 0, na.rm = TRUE),
+    n_wt_phleb_zero        = sum(wt_phlebotomy == 0, na.rm = TRUE),
+    n_wt_phleb_na          = sum(is.na(wt_phlebotomy)),
+    
+    n_wt_fasting_positive  = sum(wt_fasting > 0, na.rm = TRUE),
+    n_wt_fasting_zero      = sum(wt_fasting == 0, na.rm = TRUE),
+    n_wt_fasting_na        = sum(is.na(wt_fasting)),
+    .groups = "drop"
+  )
+
+write.csv(
+  wt_summary,
+  file.path(out_dir, "Mechanism_Hematology_QC_weight_summary.csv"),
+  row.names = FALSE
+)
+
+cat("\nWeight summary:\n")
+print(wt_summary)
+
+# ------------------------------------------------------------------------------
+# 11.3 Fasting record QC
+# ------------------------------------------------------------------------------
+
+fasting_qc <- dat %>%
+  mutate(
+    has_trigly_record = !is.na(TG_mgdL) |
+      !is.na(LBDTRSI) |
+      !is.na(LBDLDL) |
+      !is.na(LBDLDLM) |
+      !is.na(LBDLDLN),
+    fasting_weight_status = case_when(
+      is.na(wt_fasting) ~ "No fasting weight / no TRIGLY record",
+      wt_fasting == 0   ~ "Fasting weight equals 0",
+      wt_fasting > 0    ~ "Positive fasting weight",
+      TRUE              ~ "Other"
+    )
+  ) %>%
+  count(CYCLE, has_trigly_record, fasting_weight_status, name = "n") %>%
+  group_by(CYCLE) %>%
+  mutate(pct_cycle = round(n / sum(n) * 100, 2)) %>%
+  ungroup()
+
+write.csv(
+  fasting_qc,
+  file.path(out_dir, "Mechanism_Hematology_QC_fasting_status.csv"),
+  row.names = FALSE
+)
+
+cat("\nFasting-status QC:\n")
+print(fasting_qc)
+
+# ------------------------------------------------------------------------------
+# 11.4 hs-CRP BDL QC
+# ------------------------------------------------------------------------------
+
+crp_bdl_qc <- dat %>%
+  filter(!is.na(LBXHSCRP) | !is.na(LBDHRPLC)) %>%
+  group_by(CYCLE) %>%
+  summarise(
+    n_crp_nonmissing = sum(!is.na(LBXHSCRP)),
+    n_comment_nonmissing = sum(!is.na(LBDHRPLC)),
+    n_bdl = sum(LBDHRPLC == 1, na.rm = TRUE),
+    pct_bdl_among_comment_nonmissing = round(
+      100 * n_bdl / n_comment_nonmissing,
+      2
+    ),
+    min_crp = safe_min(LBXHSCRP),
+    max_crp = safe_max(LBXHSCRP),
+    .groups = "drop"
+  )
+
+write.csv(
+  crp_bdl_qc,
+  file.path(out_dir, "Mechanism_Hematology_QC_hsCRP_BDL.csv"),
+  row.names = FALSE
+)
+
+cat("\nhs-CRP BDL QC:\n")
+print(crp_bdl_qc)
+
+# ------------------------------------------------------------------------------
+# 11.5 GGT upper-limit QC
+# ------------------------------------------------------------------------------
+
+ggt_ulod_qc <- dat %>%
+  mutate(
+    LBDSGTLC_num = suppressWarnings(as.numeric(as.character(LBDSGTLC)))
+  ) %>%
+  filter(!is.na(LBXSGTSI) | !is.na(LBDSGTLC_num)) %>%
+  group_by(CYCLE) %>%
+  summarise(
+    n_ggt_nonmissing = sum(!is.na(LBXSGTSI)),
+    n_comment_nonmissing = sum(!is.na(LBDSGTLC_num)),
+    n_ulod_flag = sum(LBDSGTLC_num > 0, na.rm = TRUE),
+    pct_ulod_among_comment_nonmissing = round(
+      100 * n_ulod_flag / n_comment_nonmissing,
+      2
+    ),
+    min_ggt = safe_min(LBXSGTSI),
+    max_ggt = safe_max(LBXSGTSI),
+    .groups = "drop"
+  )
+write.csv(
+  ggt_ulod_qc,
+  file.path(out_dir, "Mechanism_Hematology_QC_GGT_ULOD.csv"),
+  row.names = FALSE
+)
+
+cat("\nGGT ULOD QC:\n")
+print(ggt_ulod_qc)
+
+# ------------------------------------------------------------------------------
+# 11.6 Extreme hematology values
+# ------------------------------------------------------------------------------
+
+lymph_extreme_qc <- dat %>%
+  filter(!is.na(LBDLYMNO), LBDLYMNO > 50) %>%
+  select(
+    SEQN,
+    CYCLE,
+    LBXWBCSI,
+    LBDLYMNO,
+    LBDNENO,
+    LBXLYPCT,
+    LBXNEPCT,
+    wt_cbc,
+    wt_phlebotomy
+  )
+
+write.csv(
+  lymph_extreme_qc,
+  file.path(out_dir, "Mechanism_Hematology_QC_extreme_LBDLYMNO_gt50.csv"),
+  row.names = FALSE
+)
+
+cat("\nExtreme LBDLYMNO > 50 rows:\n")
+print(lymph_extreme_qc)
+
+platelet_extreme_qc <- dat %>%
+  filter(!is.na(LBXPLTSI), LBXPLTSI > 1000) %>%
+  select(
+    SEQN,
+    CYCLE,
+    LBXPLTSI,
+    LBXWBCSI,
+    LBDLYMNO,
+    LBDNENO,
+    wt_cbc,
+    wt_phlebotomy
+  )
+
+write.csv(
+  platelet_extreme_qc,
+  file.path(out_dir, "Mechanism_Hematology_QC_extreme_platelet_gt1000.csv"),
+  row.names = FALSE
+)
+
+cat("\nExtreme platelet > 1000 rows:\n")
+print(platelet_extreme_qc)
+
+# ------------------------------------------------------------------------------
+# 11.7 Variable-level missingness and range summary
+# ------------------------------------------------------------------------------
+
+all_biomarker_vars <- c(
+  "LBXWBCSI", "LBXLYPCT", "LBXMOPCT", "LBXNEPCT", "LBXEOPCT", "LBXBAPCT",
+  "LBDLYMNO", "LBDMONO", "LBDNENO", "LBDEONO", "LBDBANO",
+  "LBXRBCSI", "LBXHGB", "LBXHCT", "LBXMCVSI", "LBXMC", "LBXMCHSI",
+  "LBXRDW", "LBXPLTSI", "LBXMPSI", "LBXNRBC",
+  "LBXHSCRP", "LBDHRPLC",
+  "LBXSATSI", "LBXSASSI", "LBXSAPSI", "LBXSGTSI", "LBDSGTLC",
+  "LBXSTB", "LBDSTBSI", "LBXSAL", "LBXSGB", "LBXSTP", "LBXSLDSI",
+  "LBXSCR", "LBDSCRSI", "LBXSBU", "LBXSUA", "LBXSGL", "LBXSIR",
+  "LBXSKSI", "LBXSNASI", "LBXSCLSI", "LBXSC3SI", "LBXSCA",
+  "LBXSPH", "LBXMAGN", "LBXSOSSI", "LBXSCK",
+  "LBXTC", "LBDTCSI", "LBDHDD", "LBDHDDSI",
+  "TG_mgdL", "LBDTRSI", "LBDLDL", "LBDLDLSI",
+  "LBDLDLM", "LBDLDMSI", "LBDLDLN", "LBDLDNSI",
+  "NLR", "PLR", "AST_ALT_ratio", "non_HDL_chol", "TC_HDL_ratio",
+  "wt_cbc", "wt_crp", "wt_biopro", "wt_tchol", "wt_hdl",
+  "wt_phlebotomy", "wt_fasting"
+)
+
+all_biomarker_vars <- intersect(all_biomarker_vars, names(dat))
+
+missing_qc <- data.frame(
+  variable = all_biomarker_vars,
+  n_total = nrow(dat),
+  n_nonmiss = sapply(all_biomarker_vars, function(v) {
+    sum(!is.na(dat[[v]]))
+  }),
+  n_miss = sapply(all_biomarker_vars, function(v) {
+    sum(is.na(dat[[v]]))
+  }),
+  pct_miss = sapply(all_biomarker_vars, function(v) {
+    round(mean(is.na(dat[[v]])) * 100, 2)
+  }),
+  min_val = sapply(all_biomarker_vars, function(v) {
+    round(safe_min(dat[[v]]), 4)
+  }),
+  max_val = sapply(all_biomarker_vars, function(v) {
+    round(safe_max(dat[[v]]), 4)
+  }),
+  mean_val = sapply(all_biomarker_vars, function(v) {
+    round(safe_mean(dat[[v]]), 4)
+  }),
+  row.names = NULL
+)
+
+write.csv(
+  missing_qc,
+  file.path(out_dir, "Mechanism_Hematology_QC_missingness.csv"),
+  row.names = FALSE
+)
+
+cat("\nMissingness summary first 20 rows:\n")
+print(head(missing_qc, 20))
+
+# ------------------------------------------------------------------------------
+# 11.8 Cycle distribution
+# ------------------------------------------------------------------------------
+
+cycle_dist <- dat %>%
+  count(CYCLE) %>%
+  mutate(pct = round(n / sum(n) * 100, 2))
+
+write.csv(
+  cycle_dist,
+  file.path(out_dir, "Mechanism_Hematology_QC_cycle_distribution.csv"),
+  row.names = FALSE
+)
+
+cat("\nCycle distribution:\n")
+print(cycle_dist)
+
+# ==============================================================================
+# 12. VARIABLE DICTIONARY
+# ==============================================================================
+
+cat("\n── Variable dictionary ────────────────────────────────────\n")
+
+variable_labels <- c(
+  SEQN = "Respondent sequence number",
+  SDMVPSU = "Masked PSU",
+  SDMVSTRA = "Masked stratum",
+  RIDAGEYR = "Age at screening, years",
+  RIAGENDR = "Sex",
+  RIDRETH3 = "Race/ethnicity",
+  CYCLE = "NHANES cycle",
+  wt_mec = "MEC examination weight",
+  
+  WTPH2YR_cbc = "2021-2023 phlebotomy weight from CBC_L",
+  WTPH2YR_crp = "2021-2023 phlebotomy weight from HSCRP_L",
+  WTPH2YR_biopro = "2021-2023 phlebotomy weight from BIOPRO_L",
+  WTPH2YR_tchol = "2021-2023 phlebotomy weight from TCHOL_L",
+  WTPH2YR_hdl = "2021-2023 phlebotomy weight from HDL_L",
+  WTPH2YR_any = "Coalesced 2021-2023 phlebotomy weight",
+  
+  WTSAFPRP = "2017-2020 fasting subsample weight",
+  WTSAF2YR = "2021-2023 fasting subsample weight",
+  
+  wt_cbc = "Panel-specific weight for CBC biomarkers",
+  wt_crp = "Panel-specific weight for hs-CRP",
+  wt_biopro = "Panel-specific weight for BIOPRO biomarkers",
+  wt_tchol = "Panel-specific weight for total cholesterol",
+  wt_hdl = "Panel-specific weight for HDL cholesterol",
+  wt_phlebotomy = "Coalesced non-fasting laboratory weight",
+  wt_fasting = "Fasting subsample weight",
+  
+  LBXWBCSI = "White blood cell count",
+  LBXLYPCT = "Lymphocyte percentage",
+  LBXMOPCT = "Monocyte percentage",
+  LBXNEPCT = "Neutrophil percentage",
+  LBXEOPCT = "Eosinophil percentage",
+  LBXBAPCT = "Basophil percentage",
+  LBDLYMNO = "Lymphocyte absolute count",
+  LBDMONO = "Monocyte absolute count",
+  LBDNENO = "Neutrophil absolute count",
+  LBDEONO = "Eosinophil absolute count",
+  LBDBANO = "Basophil absolute count",
+  LBXRBCSI = "Red blood cell count",
+  LBXHGB = "Hemoglobin",
+  LBXHCT = "Hematocrit",
+  LBXMCVSI = "Mean cell volume",
+  LBXMC = "Mean corpuscular hemoglobin concentration",
+  LBXMCHSI = "Mean corpuscular hemoglobin",
+  LBXRDW = "Red cell distribution width",
+  LBXPLTSI = "Platelet count",
+  LBXMPSI = "Mean platelet volume",
+  LBXNRBC = "Nucleated red blood cells",
+  
+  LBXHSCRP = "High-sensitivity C-reactive protein",
+  LBDHRPLC = "hs-CRP comment code for below LLOD",
+  
+  LBXSATSI = "ALT",
+  LBXSASSI = "AST",
+  LBXSAPSI = "Alkaline phosphatase",
+  LBXSGTSI = "GGT",
+  LBDSGTLC = "GGT comment code for upper detection limit",
+  LBXSTB = "Total bilirubin",
+  LBDSTBSI = "Total bilirubin, SI unit",
+  LBXSAL = "Albumin",
+  LBXSGB = "Globulin",
+  LBXSTP = "Total protein",
+  LBXSLDSI = "LDH",
+  LBXSCR = "Creatinine",
+  LBDSCRSI = "Creatinine, SI unit",
+  LBXSBU = "Blood urea nitrogen",
+  LBXSUA = "Uric acid",
+  LBXSGL = "Glucose",
+  LBXSIR = "Iron",
+  LBXSKSI = "Potassium",
+  LBXSNASI = "Sodium",
+  LBXSCLSI = "Chloride",
+  LBXSC3SI = "Bicarbonate",
+  LBXSCA = "Total calcium",
+  LBXSPH = "Phosphorus",
+  LBXMAGN = "Magnesium",
+  LBXSOSSI = "Osmolality",
+  LBXSCK = "Creatine phosphokinase",
+  
+  LBXTC = "Total cholesterol",
+  LBDTCSI = "Total cholesterol, SI unit",
+  LBDHDD = "HDL cholesterol",
+  LBDHDDSI = "HDL cholesterol, SI unit",
+  TG_mgdL = "Triglycerides, mg/dL",
+  LBDTRSI = "Triglycerides, SI unit",
+  LBDLDL = "Friedewald LDL cholesterol",
+  LBDLDLSI = "Friedewald LDL cholesterol, SI unit",
+  LBDLDLM = "Martin-Hopkins LDL cholesterol",
+  LBDLDMSI = "Martin-Hopkins LDL cholesterol, SI unit",
+  LBDLDLN = "NIH equation 2 LDL cholesterol",
+  LBDLDNSI = "NIH equation 2 LDL cholesterol, SI unit",
+  
+  NLR = "Neutrophil-to-lymphocyte ratio",
+  PLR = "Platelet-to-lymphocyte ratio",
+  AST_ALT_ratio = "AST/ALT ratio",
+  non_HDL_chol = "Non-HDL cholesterol",
+  TC_HDL_ratio = "Total cholesterol/HDL cholesterol ratio"
+)
+
+weight_lookup <- c(
+  rep("wt_cbc", length(cbc_vars[-1])),
+  rep("wt_crp", length(c("LBXHSCRP", "LBDHRPLC"))),
+  rep("wt_biopro", length(setdiff(biopro_vars, "SEQN"))),
+  rep("wt_tchol", length(setdiff(tchol_vars, "SEQN"))),
+  rep("wt_hdl", length(setdiff(hdl_vars, "SEQN"))),
+  rep("wt_fasting", length(c(
+    "TG_mgdL", "LBDTRSI", "LBDLDL", "LBDLDLSI",
+    "LBDLDLM", "LBDLDMSI", "LBDLDLN", "LBDLDNSI"
+  )))
+)
+
+names(weight_lookup) <- c(
+  cbc_vars[-1],
+  "LBXHSCRP", "LBDHRPLC",
+  setdiff(biopro_vars, "SEQN"),
+  setdiff(tchol_vars, "SEQN"),
+  setdiff(hdl_vars, "SEQN"),
+  "TG_mgdL", "LBDTRSI", "LBDLDL", "LBDLDLSI",
+  "LBDLDLM", "LBDLDMSI", "LBDLDLN", "LBDLDNSI"
+)
+
+weight_lookup[c(
+  "NLR", "PLR"
+)] <- "wt_cbc"
+
+weight_lookup[c(
+  "AST_ALT_ratio"
+)] <- "wt_biopro"
+
+weight_lookup[c(
+  "non_HDL_chol", "TC_HDL_ratio"
+)] <- "wt_phlebotomy or panel-specific lipid weights"
+
+var_dict <- data.frame(
+  variable = names(dat),
+  label = unname(variable_labels[names(dat)]),
+  recommended_weight = unname(weight_lookup[names(dat)]),
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  var_dict,
+  file.path(out_dir, "Mechanism_Hematology_variable_dictionary.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 13. SAVE OUTPUTS
+# ==============================================================================
+
+cat("\n── Saving outputs ─────────────────────────────────────────\n")
+
+saveRDS(
+  dat,
+  file.path(export_dir, "Mechanism_Hematology.rds")
+)
+
+write.csv(
+  dat,
+  file.path(out_dir, "Mechanism_Hematology.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 14. FINAL CONSOLE SUMMARY
+# ==============================================================================
+
+cat("\n", strrep("=", 70), "\n")
+cat("MECHANISM HEMATOLOGY DATA COMPLETE — REVISED VERSION\n")
+cat(strrep("=", 70), "\n")
+cat("Total rows      :", nrow(dat), "\n")
+cat("Total columns   :", ncol(dat), "\n")
+cat("2017-2020 N     :", sum(dat$CYCLE == "2017-2020"), "\n")
+cat("2021-2023 N     :", sum(dat$CYCLE == "2021-2023"), "\n")
+
+cat("\nKey fixes implemented:\n")
+cat("  1. WTPH2YR retained separately from CBC/CRP/BIOPRO/TCHOL/HDL.\n")
+cat("  2. wt_phlebotomy now uses coalesced WTPH2YR_any for 2021-2023.\n")
+cat("  3. Panel-specific weights wt_cbc/wt_crp/wt_biopro/wt_tchol/wt_hdl created.\n")
+cat("  4. hs-CRP comment code LBDHRPLC added.\n")
+cat("  5. GGT upper-limit comment code LBDSGTLC added.\n")
+cat("  6. log_HSCRP and log_TG are NOT pre-computed here.\n")
+cat("  7. Panel-specific N, fasting, BDL, ULOD, and extreme-value QC files exported.\n")
+
+cat("\nRecommended downstream use:\n")
+cat("  CBC biomarkers              → wt_cbc\n")
+cat("  hs-CRP                      → wt_crp\n")
+cat("  BIOPRO biomarkers           → wt_biopro\n")
+cat("  Total cholesterol           → wt_tchol\n")
+cat("  HDL cholesterol             → wt_hdl\n")
+cat("  TG / LDL fasting biomarkers → wt_fasting\n")
+cat("  General backward-compatible → wt_phlebotomy\n")
+
+cat("\nOutputs:\n")
+cat("  RDS  :", file.path(export_dir, "Mechanism_Hematology.rds"), "\n")
+cat("  CSV  :", file.path(out_dir, "Mechanism_Hematology.csv"), "\n")
+cat("  QC   :", out_dir, "\n")
+cat(strrep("=", 70), "\n")
