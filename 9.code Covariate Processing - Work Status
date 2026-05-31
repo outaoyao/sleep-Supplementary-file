@@ -1,0 +1,267 @@
+################################################################################
+# Script Name: 9. Covariate Processing - Work Status
+# Purpose:
+#   Harmonize NHANES work status across 2017-2023 cycles.
+#
+# Manuscript-consistent definition:
+#   Work status was categorized as:
+#     0 = Employed / with a job or business
+#     1 = Not currently working
+#
+# Core variable:
+#   OCD150:
+#     Type of work done last week
+#     1 = Working at a job or business
+#     2 = With a job or business but not at work
+#     3 = Looking for work
+#     4 = Not working at a job or business
+#     7 = Refused
+#     9 = Don't know
+#
+# Data Cycles:
+#   - 2017-March 2020: P_OCQ
+#   - 2021-2023: OCQ_L
+#
+# Output:
+#   - D:/code/9.data.rds
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+
+library(nhanesA)
+library(tidyverse)
+library(stringr)
+
+# 2. Environment ---------------------------------------------------------------
+
+export_dir <- "D:/code"
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = TRUE)
+}
+
+qc_dir <- file.path(export_dir, "qc_outputs")
+
+if (!dir.exists(qc_dir)) {
+  dir.create(qc_dir, recursive = TRUE)
+}
+
+# 3. Helper Functions ----------------------------------------------------------
+
+clean_ocd150_code <- function(x) {
+  
+  x_chr <- as.character(x)
+  x_chr <- str_trim(x_chr)
+  x_low <- str_to_lower(x_chr)
+  
+  case_when(
+    is.na(x_chr) ~ NA_real_,
+    
+    # Numeric codes
+    x_chr == "1" ~ 1,
+    x_chr == "2" ~ 2,
+    x_chr == "3" ~ 3,
+    x_chr == "4" ~ 4,
+    
+    # Character labels from nhanesA
+    str_detect(x_low, "^working at a job|working at a business") ~ 1,
+    str_detect(x_low, "^with a job|with a business") ~ 2,
+    str_detect(x_low, "looking for work") ~ 3,
+    str_detect(x_low, "not working") ~ 4,
+    
+    # Invalid / missing response labels
+    x_low %in% c(
+      "",
+      ".",
+      "7",
+      "9",
+      "77",
+      "99",
+      "refused",
+      "don't know",
+      "dont know",
+      "missing",
+      "na"
+    ) ~ NA_real_,
+    
+    TRUE ~ NA_real_
+  )
+}
+
+process_work_cycle <- function(table_name, cycle_label) {
+  
+  cat("Processing work status data:", cycle_label, "\n")
+  
+  raw_data <- nhanes(table_name)
+  
+  required_vars <- c("SEQN", "OCD150")
+  
+  missing_vars <- setdiff(required_vars, names(raw_data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing required work-status variables in ",
+      table_name,
+      ": ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  cat("\nRaw OCD150 distribution for", cycle_label, ":\n")
+  print(table(raw_data$OCD150, useNA = "ifany"))
+  
+  processed <- raw_data %>%
+    as_tibble() %>%
+    select(all_of(required_vars)) %>%
+    mutate(
+      SEQN = suppressWarnings(as.numeric(SEQN)),
+      
+      OCD150_raw = OCD150,
+      
+      OCD150 = clean_ocd150_code(OCD150),
+      
+      work_status = case_when(
+        OCD150 %in% c(1, 2) ~ 0,
+        OCD150 %in% c(3, 4) ~ 1,
+        TRUE ~ NA_real_
+      ),
+      
+      work_status_label = factor(
+        work_status,
+        levels = c(0, 1),
+        labels = c(
+          "Employed/with job",
+          "Not currently working"
+        )
+      ),
+      
+      # Backward-compatible aliases for previous scripts
+      employment_status = work_status,
+      employment_label = work_status_label,
+      
+      CYCLE = cycle_label
+    )
+  
+  return(processed)
+}
+
+# 4. Process Cycles ------------------------------------------------------------
+
+ocq_1720 <- process_work_cycle("P_OCQ", "2017-2020")
+ocq_2123 <- process_work_cycle("OCQ_L", "2021-2023")
+
+work_combined <- bind_rows(ocq_1720, ocq_2123)
+
+# 5. Quality Control -----------------------------------------------------------
+
+cat("\n--- Work Status Distribution by Cycle ---\n")
+
+work_dist_cycle <- work_combined %>%
+  count(CYCLE, work_status_label, name = "n") %>%
+  arrange(CYCLE, work_status_label)
+
+print(work_dist_cycle)
+
+cat("\n--- Work Status Overall Distribution ---\n")
+
+work_dist_overall <- work_combined %>%
+  count(work_status_label, name = "n") %>%
+  arrange(work_status_label)
+
+print(work_dist_overall)
+
+cat("\n--- Detailed Raw Work Status Distribution ---\n")
+
+work_raw_dist <- work_combined %>%
+  count(CYCLE, OCD150_raw, work_status_label, name = "n") %>%
+  arrange(CYCLE, OCD150_raw, work_status_label)
+
+print(work_raw_dist)
+
+cat("\n--- Missingness Audit ---\n")
+
+missing_audit <- work_combined %>%
+  summarise(
+    n_total = n(),
+    
+    missing_OCD150 =
+      sum(is.na(OCD150)),
+    
+    missing_work_status =
+      sum(is.na(work_status_label)),
+    
+    n_employed_or_with_job =
+      sum(work_status == 0, na.rm = TRUE),
+    
+    n_not_currently_working =
+      sum(work_status == 1, na.rm = TRUE)
+  )
+
+print(missing_audit)
+
+cat("\n--- Cycle-specific Missingness Audit ---\n")
+
+missing_audit_cycle <- work_combined %>%
+  group_by(CYCLE) %>%
+  summarise(
+    n_total = n(),
+    
+    missing_OCD150 =
+      sum(is.na(OCD150)),
+    
+    n_employed_or_with_job =
+      sum(work_status == 0, na.rm = TRUE),
+    
+    n_not_currently_working =
+      sum(work_status == 1, na.rm = TRUE),
+    
+    missing_work_status =
+      sum(is.na(work_status_label)),
+    
+    .groups = "drop"
+  )
+
+print(missing_audit_cycle)
+
+# 6. Save QC Outputs -----------------------------------------------------------
+
+write_csv(
+  work_dist_cycle,
+  file.path(qc_dir, "Step9_work_status_distribution_by_cycle.csv")
+)
+
+write_csv(
+  work_dist_overall,
+  file.path(qc_dir, "Step9_work_status_distribution_overall.csv")
+)
+
+write_csv(
+  work_raw_dist,
+  file.path(qc_dir, "Step9_work_status_raw_label_qc.csv")
+)
+
+write_csv(
+  missing_audit,
+  file.path(qc_dir, "Step9_work_status_missingness_audit.csv")
+)
+
+write_csv(
+  missing_audit_cycle,
+  file.path(qc_dir, "Step9_work_status_missingness_audit_by_cycle.csv")
+)
+
+# 7. Export --------------------------------------------------------------------
+
+save_path <- file.path(export_dir, "9.data.rds")
+
+saveRDS(work_combined, save_path)
+
+cat("\nWork status data successfully exported to:", save_path, "\n")
+cat("QC files saved to:", qc_dir, "\n")
+cat(
+  "Final Dataset dimensions:",
+  dim(work_combined)[1],
+  "rows and",
+  dim(work_combined)[2],
+  "variables.\n"
+)
