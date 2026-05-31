@@ -1,0 +1,674 @@
+################################################################################
+# STEP 20
+# RCS analysis for six-domain CMB_Score
+# Complete-case main analysis
+################################################################################
+
+rm(list = ls())
+
+library(survey)
+library(rms)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+
+options(survey.lonely.psu = "adjust")
+
+# ==============================================================================
+# 0. Paths
+# ==============================================================================
+
+root_dir <- "D:/code"
+
+data_path <- file.path(
+  root_dir,
+  "18.Dataset_CMB_six_domain_complete_case.rds"
+)
+
+out_dir <- file.path(
+  root_dir,
+  "Step20_CMB_RCS"
+)
+
+fig_dir <- file.path(out_dir, "figures")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(data_path)) {
+  stop("Cannot find: D:/code/18.Dataset_CMB_six_domain_complete_case.rds")
+}
+
+# ==============================================================================
+# 1. Load data
+# ==============================================================================
+
+dat0 <- readRDS(data_path)
+dat0 <- as.data.frame(dat0)
+
+cat("Dataset loaded:\n")
+cat("Rows:", nrow(dat0), "\n")
+cat("Cols:", ncol(dat0), "\n\n")
+
+# ==============================================================================
+# 2. Variables
+# ==============================================================================
+
+outcome_var <- "Moderate_depression_above"
+exposure_var <- "CMB_Score"
+
+model2_covars <- c(
+  "RIDAGEYR",
+  "sex",
+  "race_ethnicity"
+)
+
+model3_covars <- c(
+  model2_covars,
+  "education",
+  "marital_status",
+  "smoke_label",
+  "BMI_value",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label",
+  "MET_total",
+  "INDFMPIR"
+)
+
+model4_covars <- c(
+  model3_covars,
+  "sedentary_min"
+)
+
+factor_vars <- c(
+  "sex",
+  "race_ethnicity",
+  "education",
+  "marital_status",
+  "smoke_label",
+  "AlcoholCategory",
+  "diabetes_label",
+  "hypertension_label",
+  "work_status_label"
+)
+
+required_vars <- unique(c(
+  "SEQN",
+  "SDMVPSU",
+  "SDMVSTRA",
+  "mec_adj",
+  outcome_var,
+  exposure_var,
+  model4_covars
+))
+
+missing_vars <- setdiff(required_vars, names(dat0))
+
+if (length(missing_vars) > 0) {
+  stop(
+    paste0(
+      "Missing variables:\n",
+      paste(missing_vars, collapse = ", ")
+    )
+  )
+}
+
+for (v in factor_vars) {
+  dat0[[v]] <- as.factor(dat0[[v]])
+}
+
+dat <- dat0 %>%
+  dplyr::select(all_of(required_vars)) %>%
+  dplyr::filter(
+    complete.cases(.),
+    mec_adj > 0,
+    SDMVPSU > 0,
+    SDMVSTRA > 0
+  )
+
+cat("Analysis N:", nrow(dat), "\n")
+
+cat("\nOutcome distribution:\n")
+print(table(dat[[outcome_var]], useNA = "ifany"))
+
+cat("\nCMB score summary:\n")
+print(summary(dat[[exposure_var]]))
+
+cat("\nCMB score range:\n")
+print(range(dat[[exposure_var]], na.rm = TRUE))
+
+# ==============================================================================
+# 3. Survey design
+# ==============================================================================
+
+dd <- datadist(dat)
+options(datadist = "dd")
+
+design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = dat,
+  nest = TRUE
+)
+
+# ==============================================================================
+# 4. Model helpers
+# ==============================================================================
+
+make_formula <- function(exposure, covars = NULL, knots = 4) {
+  
+  rhs <- paste0("rcs(", exposure, ", ", knots, ")")
+  
+  if (!is.null(covars) && length(covars) > 0) {
+    rhs <- paste(rhs, paste(covars, collapse = " + "), sep = " + ")
+  }
+  
+  as.formula(
+    paste(outcome_var, "~", rhs)
+  )
+}
+
+fit_svy_rcs <- function(covars = NULL, knots = 4) {
+  
+  svyglm(
+    formula = make_formula(exposure_var, covars, knots),
+    design = design,
+    family = quasibinomial()
+  )
+}
+
+# ==============================================================================
+# 5. Fit 4 RCS models
+# ==============================================================================
+
+model_m1 <- fit_svy_rcs(NULL, 4)
+model_m2 <- fit_svy_rcs(model2_covars, 4)
+model_m3 <- fit_svy_rcs(model3_covars, 4)
+model_m4 <- fit_svy_rcs(model4_covars, 4)
+
+cat("\nAll four RCS models fitted.\n")
+
+# ==============================================================================
+# 6. Knot sensitivity
+# ==============================================================================
+
+compare_knots <- function(covars = model4_covars) {
+  
+  out <- data.frame(
+    knots = 3:5,
+    AIC = NA_real_
+  )
+  
+  for (k in 3:5) {
+    
+    fit_k <- fit_svy_rcs(
+      covars = covars,
+      knots = k
+    )
+    
+    out$AIC[out$knots == k] <- AIC(fit_k)[1]
+  }
+  
+  out
+}
+
+knot_results <- compare_knots(model4_covars)
+
+write.csv(
+  knot_results,
+  file.path(out_dir, "Step20_CMB_RCS_knot_sensitivity.csv"),
+  row.names = FALSE
+)
+
+cat("\nKnot sensitivity:\n")
+print(knot_results)
+
+# ==============================================================================
+# 7. Prediction data
+# ==============================================================================
+
+get_mode_value <- function(x) {
+  x <- x[!is.na(x)]
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+
+make_reference_newdata <- function(data, covars, n_grid = 200) {
+  
+  grid <- seq(
+    min(data[[exposure_var]], na.rm = TRUE),
+    max(data[[exposure_var]], na.rm = TRUE),
+    length.out = n_grid
+  )
+  
+  newdat <- data.frame(CMB_Score = grid)
+  
+  for (v in covars) {
+    
+    if (is.factor(data[[v]])) {
+      
+      ref <- get_mode_value(data[[v]])
+      
+      newdat[[v]] <- factor(
+        ref,
+        levels = levels(data[[v]])
+      )
+      
+    } else {
+      
+      newdat[[v]] <- median(data[[v]], na.rm = TRUE)
+    }
+  }
+  
+  newdat
+}
+
+predict_rcs_manual <- function(model, covars, model_name) {
+  
+  newdat <- make_reference_newdata(
+    data = dat,
+    covars = covars,
+    n_grid = 200
+  )
+  
+  X <- model.matrix(
+    delete.response(terms(model)),
+    data = newdat
+  )
+  
+  beta <- coef(model)
+  V <- vcov(model)
+  
+  common <- intersect(colnames(X), names(beta))
+  
+  X <- X[, common, drop = FALSE]
+  beta <- beta[common]
+  V <- V[common, common, drop = FALSE]
+  
+  fit <- as.numeric(X %*% beta)
+  se <- sqrt(pmax(0, rowSums((X %*% V) * X)))
+  
+  ref_fit <- min(fit, na.rm = TRUE)
+  
+  data.frame(
+    CMB_Score = newdat[[exposure_var]],
+    OR = exp(fit - ref_fit),
+    lower95 = exp((fit - 1.96 * se) - ref_fit),
+    upper95 = exp((fit + 1.96 * se) - ref_fit),
+    model = model_name
+  )
+}
+
+plot_m1 <- predict_rcs_manual(model_m1, NULL, "Model 1")
+plot_m2 <- predict_rcs_manual(model_m2, model2_covars, "Model 2")
+plot_m3 <- predict_rcs_manual(model_m3, model3_covars, "Model 3")
+plot_m4 <- predict_rcs_manual(model_m4, model4_covars, "Model 4")
+
+plot_all <- bind_rows(
+  plot_m1,
+  plot_m2,
+  plot_m3,
+  plot_m4
+)
+
+write.csv(
+  plot_all,
+  file.path(out_dir, "Step20_CMB_RCS_plot_data_all_models.csv"),
+  row.names = FALSE
+)
+
+# ==============================================================================
+# 8. Weighted RCS P values
+# ==============================================================================
+
+wald_test_terms <- function(model, term_index) {
+  
+  beta <- coef(model)
+  V <- vcov(model)
+  
+  term_index <- term_index[!is.na(term_index)]
+  
+  if (length(term_index) == 0) {
+    return(NA_real_)
+  }
+  
+  b <- beta[term_index]
+  VV <- V[term_index, term_index, drop = FALSE]
+  
+  stat <- as.numeric(t(b) %*% solve(VV) %*% b)
+  df <- length(b)
+  
+  pchisq(stat, df = df, lower.tail = FALSE)
+}
+
+get_rcs_pvalues <- function(model, model_name) {
+  
+  coef_names <- names(coef(model))
+  
+  rcs_index <- grep(
+    exposure_var,
+    coef_names,
+    fixed = TRUE
+  )
+  
+  if (length(rcs_index) == 0) {
+    stop(paste0("No RCS coefficients found in ", model_name))
+  }
+  
+  nonlinear_index <- rcs_index[-1]
+  
+  data.frame(
+    Model = model_name,
+    n_rcs_terms = length(rcs_index),
+    Overall_P = wald_test_terms(model, rcs_index),
+    Nonlinear_P = wald_test_terms(model, nonlinear_index),
+    rcs_terms = paste(coef_names[rcs_index], collapse = " | ")
+  )
+}
+
+format_p <- function(p) {
+  
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  
+  sprintf("%.3f", round(p, 3))
+}
+
+p_table <- bind_rows(
+  get_rcs_pvalues(model_m1, "Model 1"),
+  get_rcs_pvalues(model_m2, "Model 2"),
+  get_rcs_pvalues(model_m3, "Model 3"),
+  get_rcs_pvalues(model_m4, "Model 4")
+) %>%
+  mutate(
+    Overall_P_fmt = sapply(Overall_P, format_p),
+    Nonlinear_P_fmt = sapply(Nonlinear_P, format_p)
+  )
+
+write.csv(
+  p_table,
+  file.path(out_dir, "Step20_CMB_RCS_P_values.csv"),
+  row.names = FALSE
+)
+
+cat("\nWeighted RCS P values:\n")
+print(p_table)
+
+# ==============================================================================
+# 9. Nadir and reference interval based on Model 4
+# ==============================================================================
+
+VAL_REF <- 1.05
+VAL_MILD <- 1.20
+VAL_MODERATE <- 1.50
+
+model4_plot <- plot_m4
+
+idx_nadir <- which.min(model4_plot$OR)
+nadir_or <- model4_plot$OR[idx_nadir]
+nadir_score <- model4_plot$CMB_Score[idx_nadir]
+
+ref_dat <- model4_plot[
+  model4_plot$OR <= VAL_REF * nadir_or,
+]
+
+nadir_table <- data.frame(
+  nadir_CMB_score = nadir_score,
+  nadir_OR = nadir_or,
+  reference_start = min(ref_dat$CMB_Score, na.rm = TRUE),
+  reference_end = max(ref_dat$CMB_Score, na.rm = TRUE)
+)
+
+write.csv(
+  nadir_table,
+  file.path(out_dir, "Step20_CMB_Model4_nadir_reference_interval.csv"),
+  row.names = FALSE
+)
+
+cat("\nModel 4 nadir/reference interval:\n")
+print(nadir_table)
+
+score_gradient <- model4_plot %>%
+  mutate(
+    risk_score = case_when(
+      OR <= VAL_REF * nadir_or ~ 0L,
+      OR <= VAL_MILD * nadir_or ~ 1L,
+      OR <= VAL_MODERATE * nadir_or ~ 2L,
+      TRUE ~ 3L
+    )
+  ) %>%
+  group_by(risk_score) %>%
+  summarise(
+    start_CMB = min(CMB_Score),
+    end_CMB = max(CMB_Score),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    gradient = c(
+      "Reference",
+      "Mild",
+      "Moderate",
+      "High"
+    )[risk_score + 1]
+  )
+
+write.csv(
+  score_gradient,
+  file.path(out_dir, "Step20_CMB_Model4_gradient_intervals.csv"),
+  row.names = FALSE
+)
+
+cat("\nModel 4 gradient intervals:\n")
+print(score_gradient)
+
+# ==============================================================================
+# 10. Figures
+# ==============================================================================
+
+model_colors <- c(
+  "Model 1" = "#0072B2",
+  "Model 2" = "#56B4E9",
+  "Model 3" = "#E69F00",
+  "Model 4" = "#D55E00"
+)
+
+theme_rcs_clean <- function(base_size = 11) {
+  
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.title = element_blank(),
+      axis.text = element_text(
+        color = "black",
+        size = base_size * 0.9
+      ),
+      axis.line = element_line(
+        color = "black",
+        linewidth = 0.45
+      ),
+      axis.ticks = element_line(
+        color = "black",
+        linewidth = 0.35
+      ),
+      panel.grid = element_blank(),
+      legend.position = "none",
+      plot.margin = margin(6, 8, 6, 6)
+    )
+}
+
+# Model 4 main figure
+p_m4 <- ggplot(
+  plot_m4,
+  aes(
+    x = CMB_Score,
+    y = OR
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = lower95,
+      ymax = upper95
+    ),
+    fill = "#0072B2",
+    alpha = 0.18,
+    colour = NA
+  ) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    linewidth = 0.45,
+    color = "grey40"
+  ) +
+  geom_line(
+    color = "#0072B2",
+    linewidth = 0.9
+  ) +
+  scale_x_continuous(
+    breaks = seq(
+      floor(min(dat[[exposure_var]], na.rm = TRUE)),
+      ceiling(max(dat[[exposure_var]], na.rm = TRUE)),
+      by = 3
+    )
+  ) +
+  scale_y_continuous(
+    breaks = pretty(
+      c(plot_m4$lower95, plot_m4$upper95),
+      n = 5
+    )
+  ) +
+  theme_rcs_clean()
+
+ggsave(
+  filename = file.path(fig_dir, "Step20_CMB_RCS_Model4.tiff"),
+  plot = p_m4,
+  width = 4.2,
+  height = 3.4,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step20_CMB_RCS_Model4.png"),
+  plot = p_m4,
+  width = 4.2,
+  height = 3.4,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+# All-model supplementary figure
+p_all <- ggplot(
+  plot_all,
+  aes(
+    x = CMB_Score,
+    y = OR,
+    color = model,
+    fill = model
+  )
+) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    linewidth = 0.45,
+    color = "grey40"
+  ) +
+  geom_line(
+    linewidth = 0.85
+  ) +
+  scale_color_manual(
+    values = model_colors
+  ) +
+  scale_fill_manual(
+    values = model_colors
+  ) +
+  scale_x_continuous(
+    breaks = seq(
+      floor(min(dat[[exposure_var]], na.rm = TRUE)),
+      ceiling(max(dat[[exposure_var]], na.rm = TRUE)),
+      by = 3
+    )
+  ) +
+  scale_y_continuous(
+    breaks = pretty(plot_all$OR, n = 5)
+  ) +
+  theme_rcs_clean()
+
+ggsave(
+  filename = file.path(fig_dir, "Step20_CMB_RCS_all_models.tiff"),
+  plot = p_all,
+  width = 4.8,
+  height = 3.6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(fig_dir, "Step20_CMB_RCS_all_models.png"),
+  plot = p_all,
+  width = 4.8,
+  height = 3.6,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+print(p_m4)
+
+# ==============================================================================
+# 11. QC summary
+# ==============================================================================
+
+qc <- data.frame(
+  item = c(
+    "input_dataset",
+    "analysis_n",
+    "exposure",
+    "outcome",
+    "CMB_min",
+    "CMB_max",
+    "model4_overall_p",
+    "model4_nonlinear_p",
+    "nadir_CMB_score",
+    "reference_interval",
+    "model4_tiff",
+    "all_models_tiff"
+  ),
+  value = c(
+    data_path,
+    nrow(dat),
+    exposure_var,
+    outcome_var,
+    min(dat[[exposure_var]], na.rm = TRUE),
+    max(dat[[exposure_var]], na.rm = TRUE),
+    p_table$Overall_P_fmt[p_table$Model == "Model 4"],
+    p_table$Nonlinear_P_fmt[p_table$Model == "Model 4"],
+    round(nadir_table$nadir_CMB_score, 3),
+    paste0(
+      round(nadir_table$reference_start, 3),
+      "-",
+      round(nadir_table$reference_end, 3)
+    ),
+    file.path(fig_dir, "Step20_CMB_RCS_Model4.tiff"),
+    file.path(fig_dir, "Step20_CMB_RCS_all_models.tiff")
+  )
+)
+
+write.csv(
+  qc,
+  file.path(out_dir, "Step20_CMB_RCS_QC_summary.csv"),
+  row.names = FALSE
+)
+
+cat("\n============================================================\n")
+cat("STEP 20 CMB RCS COMPLETE\n")
+cat("============================================================\n")
+cat("Analysis N:", nrow(dat), "\n")
+cat("Output dir:", out_dir, "\n")
+cat("Figure dir:", fig_dir, "\n")
+cat("============================================================\n")
