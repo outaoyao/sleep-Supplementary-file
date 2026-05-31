@@ -1,0 +1,541 @@
+################################################################################
+# STEP 17 MI-ELIGIBLE
+# Sleep wake timing and depression
+#
+# Purpose:
+#   1. Use 12.Dataset_MI_Eligible.rds
+#   2. Do NOT delete cases due to covariate missingness
+#   3. Use exposure + outcome only
+#   4. Draw one RCS figure only
+#   5. Figure style matches main analysis
+################################################################################
+
+rm(list = ls())
+
+library(survey)
+library(rms)
+library(ggplot2)
+library(dplyr)
+library(cowplot)
+
+options(survey.lonely.psu = "adjust")
+
+# ==============================================================================
+# 0. Paths
+# ==============================================================================
+
+root_dir <- "D:/code"
+
+data_path <- file.path(
+  root_dir,
+  "12.Dataset_MI_Eligible.rds"
+)
+
+if (!file.exists(data_path)) {
+  stop("Cannot find: D:/code/12.Dataset_MI_Eligible.rds")
+}
+
+out_dir <- file.path(
+  root_dir,
+  "Step17_MI_Eligible_RCS_exposure_outcome_only"
+)
+
+fig_dir <- file.path(out_dir, "figures")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ==============================================================================
+# 1. Load data
+# ==============================================================================
+
+dat0 <- readRDS(data_path)
+dat0 <- as.data.frame(dat0)
+
+cat("Loaded dataset:\n")
+cat("Rows:", nrow(dat0), "\n")
+cat("Cols:", ncol(dat0), "\n\n")
+
+# ==============================================================================
+# 2. Create exposure variables
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Weekday wake
+# ------------------------------------------------------------------------------
+
+if ("wake_time_wd_hour" %in% names(dat0)) {
+  
+  dat0$sleep_wake_weekday_hours <- dat0$wake_time_wd_hour
+  
+} else if ("wake_wd_hour" %in% names(dat0)) {
+  
+  dat0$sleep_wake_weekday_hours <- dat0$wake_wd_hour
+  
+} else if ("sleep_wake_weekday_hours" %in% names(dat0)) {
+  
+  dat0$sleep_wake_weekday_hours <- dat0$sleep_wake_weekday_hours
+  
+} else {
+  
+  stop("Missing weekday wake variable.")
+}
+
+# ------------------------------------------------------------------------------
+# Weekend wake
+# ------------------------------------------------------------------------------
+
+if ("wake_time_we_hour" %in% names(dat0)) {
+  
+  dat0$sleep_wake_weekend_hours <- dat0$wake_time_we_hour
+  
+} else if ("wake_we_hour" %in% names(dat0)) {
+  
+  dat0$sleep_wake_weekend_hours <- dat0$wake_we_hour
+  
+} else if ("sleep_wake_weekend_hours" %in% names(dat0)) {
+  
+  dat0$sleep_wake_weekend_hours <- dat0$sleep_wake_weekend_hours
+  
+} else {
+  
+  stop("Missing weekend wake variable.")
+}
+
+# ==============================================================================
+# 3. Required variables only
+# ==============================================================================
+
+outcome_var <- "Moderate_depression_above"
+
+required_vars <- c(
+  "SEQN",
+  "SDMVPSU",
+  "SDMVSTRA",
+  "mec_adj",
+  outcome_var,
+  "sleep_wake_weekday_hours",
+  "sleep_wake_weekend_hours"
+)
+
+missing_vars <- setdiff(required_vars, names(dat0))
+
+if (length(missing_vars) > 0) {
+  
+  stop(
+    paste0(
+      "Missing variables: ",
+      paste(missing_vars, collapse = ", ")
+    )
+  )
+}
+
+dat <- dat0 %>%
+  dplyr::select(all_of(required_vars)) %>%
+  dplyr::filter(
+    !is.na(.data[[outcome_var]]),
+    !is.na(sleep_wake_weekday_hours),
+    !is.na(sleep_wake_weekend_hours),
+    !is.na(mec_adj),
+    !is.na(SDMVPSU),
+    !is.na(SDMVSTRA),
+    mec_adj > 0,
+    SDMVPSU > 0,
+    SDMVSTRA > 0
+  )
+
+cat("Original N:", nrow(dat0), "\n")
+cat("Analysis N:", nrow(dat), "\n")
+cat("Removed N :", nrow(dat0) - nrow(dat), "\n\n")
+
+# ==============================================================================
+# 4. Survey design
+# ==============================================================================
+
+dd <- datadist(dat)
+options(datadist = "dd")
+
+design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = dat,
+  nest = TRUE
+)
+
+# ==============================================================================
+# 5. Fit RCS models
+# ==============================================================================
+
+fit_weekday <- svyglm(
+  Moderate_depression_above ~
+    rcs(sleep_wake_weekday_hours, 4),
+  design = design,
+  family = quasibinomial()
+)
+
+fit_weekend <- svyglm(
+  Moderate_depression_above ~
+    rcs(sleep_wake_weekend_hours, 4),
+  design = design,
+  family = quasibinomial()
+)
+
+# ==============================================================================
+# 6. Prediction function
+# ==============================================================================
+
+make_newdata <- function(exposure) {
+  
+  newdat <- data.frame(
+    x = seq(0, 24, length.out = 200)
+  )
+  
+  names(newdat)[1] <- exposure
+  
+  newdat
+}
+
+predict_rcs <- function(model, exposure, timing) {
+  
+  newdat <- make_newdata(exposure)
+  
+  X <- model.matrix(
+    delete.response(terms(model)),
+    data = newdat
+  )
+  
+  beta <- coef(model)
+  V <- vcov(model)
+  
+  common <- intersect(colnames(X), names(beta))
+  
+  X <- X[, common, drop = FALSE]
+  beta <- beta[common]
+  V <- V[common, common, drop = FALSE]
+  
+  fit <- as.numeric(X %*% beta)
+  
+  se <- sqrt(
+    pmax(0, rowSums((X %*% V) * X))
+  )
+  
+  ref_fit <- min(fit, na.rm = TRUE)
+  
+  data.frame(
+    hours = newdat[[exposure]],
+    yhat = exp(fit - ref_fit),
+    lower = exp((fit - 1.96 * se) - ref_fit),
+    upper = exp((fit + 1.96 * se) - ref_fit),
+    timing = timing
+  )
+}
+
+plot_weekday <- predict_rcs(
+  fit_weekday,
+  "sleep_wake_weekday_hours",
+  "Weekday"
+)
+
+plot_weekend <- predict_rcs(
+  fit_weekend,
+  "sleep_wake_weekend_hours",
+  "Weekend"
+)
+
+plot_data <- rbind(
+  plot_weekday,
+  plot_weekend
+)
+
+# ==============================================================================
+# 7. P values
+# ==============================================================================
+
+wald_test <- function(model, exposure, nonlinear_only = FALSE) {
+  
+  beta <- coef(model)
+  V <- vcov(model)
+  
+  idx <- grep(
+    exposure,
+    names(beta),
+    fixed = TRUE
+  )
+  
+  if (nonlinear_only) {
+    idx <- idx[-1]
+  }
+  
+  b <- beta[idx]
+  VV <- V[idx, idx, drop = FALSE]
+  
+  stat <- as.numeric(
+    t(b) %*% solve(VV) %*% b
+  )
+  
+  df <- length(b)
+  
+  pchisq(
+    stat,
+    df = df,
+    lower.tail = FALSE
+  )
+}
+
+format_p <- function(p) {
+  
+  if (is.na(p)) return(NA_character_)
+  
+  if (p < 0.001) return("<0.001")
+  
+  sprintf("%.3f", round(p, 3))
+}
+
+p_table <- data.frame(
+  Timing = c("Weekday", "Weekend"),
+  
+  Overall_P = c(
+    wald_test(
+      fit_weekday,
+      "sleep_wake_weekday_hours",
+      FALSE
+    ),
+    
+    wald_test(
+      fit_weekend,
+      "sleep_wake_weekend_hours",
+      FALSE
+    )
+  ),
+  
+  Nonlinear_P = c(
+    wald_test(
+      fit_weekday,
+      "sleep_wake_weekday_hours",
+      TRUE
+    ),
+    
+    wald_test(
+      fit_weekend,
+      "sleep_wake_weekend_hours",
+      TRUE
+    )
+  )
+)
+
+p_table <- p_table %>%
+  mutate(
+    Overall_P_fmt = sapply(Overall_P, format_p),
+    Nonlinear_P_fmt = sapply(Nonlinear_P, format_p)
+  )
+
+print(p_table)
+
+# ==============================================================================
+# 8. Score construction
+# ==============================================================================
+
+VAL_REF <- 1.05
+VAL_MILD <- 1.20
+VAL_MODERATE <- 1.50
+
+map_or_to_score <- function(hours_val, rcs_plot_data) {
+  
+  idx <- which.min(
+    abs(rcs_plot_data$hours - hours_val)
+  )
+  
+  predicted_or <- rcs_plot_data$yhat[idx]
+  
+  nadir_or <- min(rcs_plot_data$yhat)
+  
+  dplyr::case_when(
+    predicted_or <= VAL_REF * nadir_or ~ 0L,
+    predicted_or <= VAL_MILD * nadir_or ~ 1L,
+    predicted_or <= VAL_MODERATE * nadir_or ~ 2L,
+    TRUE ~ 3L
+  )
+}
+
+dat_scored <- dat %>%
+  mutate(
+    weekday_wake_score = sapply(
+      sleep_wake_weekday_hours,
+      map_or_to_score,
+      rcs_plot_data = plot_weekday
+    ),
+    
+    weekend_wake_score = sapply(
+      sleep_wake_weekend_hours,
+      map_or_to_score,
+      rcs_plot_data = plot_weekend
+    ),
+    
+    sleep_wake_total_score =
+      weekday_wake_score +
+      weekend_wake_score
+  )
+
+# ==============================================================================
+# 9. Score association
+# ==============================================================================
+
+design_score <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = dat_scored,
+  nest = TRUE
+)
+
+score_model <- svyglm(
+  Moderate_depression_above ~
+    sleep_wake_total_score,
+  design = design_score,
+  family = quasibinomial()
+)
+
+score_coef <- summary(score_model)$coefficients
+
+score_result <- data.frame(
+  term = "sleep_wake_total_score",
+  
+  OR = exp(
+    score_coef[
+      "sleep_wake_total_score",
+      "Estimate"
+    ]
+  ),
+  
+  lower95 = exp(
+    score_coef[
+      "sleep_wake_total_score",
+      "Estimate"
+    ] -
+      1.96 *
+      score_coef[
+        "sleep_wake_total_score",
+        "Std. Error"
+      ]
+  ),
+  
+  upper95 = exp(
+    score_coef[
+      "sleep_wake_total_score",
+      "Estimate"
+    ] +
+      1.96 *
+      score_coef[
+        "sleep_wake_total_score",
+        "Std. Error"
+      ]
+  ),
+  
+  p_value = score_coef[
+    "sleep_wake_total_score",
+    "Pr(>|t|)"
+  ]
+)
+
+print(score_result)
+
+# ==============================================================================
+# 10. Figure
+# ==============================================================================
+
+color_scheme <- c(
+  "Weekday" = "#7EC3EB",
+  "Weekend" = "#F2B84B"
+)
+
+journal_theme_bare <- function(base_size = 10) {
+  
+  theme_bw(base_size = base_size, base_family = "Arial") +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(
+        colour = "black",
+        linewidth = 0.6,
+        fill = NA
+      ),
+      axis.title = element_blank(),
+      axis.text = element_text(
+        colour = "black",
+        size = base_size * 0.9
+      ),
+      axis.ticks = element_line(
+        colour = "black",
+        linewidth = 0.35
+      ),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none",
+      plot.title = element_blank(),
+      plot.margin = margin(6, 8, 4, 6)
+    )
+}
+
+p <- ggplot(
+  plot_data,
+  aes(
+    x = hours,
+    y = yhat,
+    group = timing
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = lower,
+      ymax = upper,
+      fill = timing
+    ),
+    alpha = 0.18,
+    colour = NA
+  ) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    colour = "grey40",
+    linewidth = 0.45
+  ) +
+  geom_line(
+    aes(colour = timing),
+    linewidth = 0.85
+  ) +
+  scale_colour_manual(values = color_scheme) +
+  scale_fill_manual(values = color_scheme) +
+  scale_x_continuous(
+    breaks = seq(0, 24, by = 4),
+    limits = c(0, 24)
+  ) +
+  journal_theme_bare()
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "Step17_MI_Eligible_RCS_bare.png"
+  ),
+  plot = p,
+  width = 3.5,
+  height = 3.2,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(
+    fig_dir,
+    "Step17_MI_Eligible_RCS_bare.tiff"
+  ),
+  plot = p,
+  width = 3.5,
+  height = 3.2,
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+cat("\n============================================================\n")
+cat("STEP 17 MI-ELIGIBLE COMPLETE\n")
+cat("============================================================\n")
